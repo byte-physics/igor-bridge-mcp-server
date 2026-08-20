@@ -522,10 +522,10 @@ End
 /// (Re-)binds this module's ZeroMQ ROUTER socket and starts its handler. Does not call
 /// zeromq_stop() first, so it won't tear down any other ZeroMQ binds in the same
 /// experiment (e.g. MIES's own). Safe to call repeatedly -- an already-bound error is
-/// caught, not propagated. Called only from IgorStartOrNewHook; recompiles instead just
+/// caught, not propagated. Called from IgorStartOrNewHook; recompiles instead just
 /// stop/restart the handler via ZBR_StopHandlerBeforeRecompile/
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
-static Function ZBR_EnsureZeroMQBound()
+Function ZBR_EnsureZeroMQBound()
 
 	variable err, port
 	string bindURL, envPort
