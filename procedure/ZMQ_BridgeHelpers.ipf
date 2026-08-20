@@ -140,6 +140,8 @@ Function/S ZBR_SubmitCommandUnattended(string cmd)
 
 	string token, finishCall, restore
 
+	ZBR_EnsureStorage()
+
 	DebuggerOptions
 	variable/G root:Packages:ZBR:savedDebugEnable    = V_enable
 	variable/G root:Packages:ZBR:savedDebugOnError   = V_debugOnError
