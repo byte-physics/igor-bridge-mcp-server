@@ -250,6 +250,7 @@ End
 /// for the crash mitigation this exists for.
 Function ZBR_SubmitReloadAndCompile()
 
+	Execute/P/Q/Z "AUTOCOMPILE OFF "
 	Execute/P/Q/Z "ZBR#ZBR_StopHandlerBeforeRecompile()"
 	Execute/P/Q/Z "RELOAD CHANGED PROCS "
 	Execute/P/Q/Z "COMPILEPROCEDURES "
@@ -276,6 +277,7 @@ Function ZBR_StartHandlerAfterRecompile()
 	variable err
 
 	zeromq_handler_start(); err = GetRTError(1)
+	Execute/P/Q/Z "AUTOCOMPILE ON "
 
 	return 0
 End
