@@ -28,6 +28,9 @@ static StrConstant ZBR_ZEROMQ_ENV_PORT     = "IGOR_PRO_BRIDGE_PORT"
 
 static StrConstant ZBR_RECOMPILE_WATCHDOG_TASK = "ZBR_RecompileWatchdog"
 
+static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
+static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
+
 // --- Storage -------------------------------------------------------------------------
 
 /// Parallel-array storage for in-flight ZBR_SubmitCommand() calls, indexed by row. A
@@ -118,6 +121,35 @@ static Function/S ZBR_AllocateToken()
 	return num2istr(n)
 End
 
+/// Deferred: Remember if a global V_flag exists in the current data folder and its value.
+Function ZBR_RememberVFlag()
+
+	NVAR/Z vFlag = V_flag
+
+	ZBR_EnsureStorage()
+	variable/G root:Packages:ZBR:vFlagExistedBefore = NVAR_Exists(vFlag)
+	variable/G root:Packages:ZBR:vFlagValueBefore   = NVAR_Exists(vFlag) ? vFlag : NaN
+
+	return 0
+End
+
+/// Deferred: Remove the global V_flag created by Execute/Z. If it already existed before,
+/// restore its value instead, see ZBR_RememberVFlag().
+Function ZBR_RemoveVFlag()
+
+	NVAR/Z vFlag = V_flag
+
+	if(!NumVarOrDefault("root:Packages:ZBR:vFlagExistedBefore", 1))
+		KillVariables/Z V_flag
+	elseif(NVAR_Exists(vFlag) && exists("root:Packages:ZBR:vFlagValueBefore") == 2)
+		vFlag = NumVarOrDefault("root:Packages:ZBR:vFlagValueBefore", NaN)
+	endif
+
+	KillVariables/Z root:Packages:ZBR:vFlagExistedBefore, root:Packages:ZBR:vFlagValueBefore
+
+	return 0
+End
+
 /// Queues `cmd` for deferred execution and returns a token to poll via ZBR_PollCommand().
 /// `cmd` and the finish-callback are queued as separate Execute/P entries so the
 /// callback still runs even if `cmd` fails to parse or errors -- see SESSION_NOTES.md.
@@ -127,8 +159,10 @@ Function/S ZBR_SubmitCommand(string cmd)
 
 	token = ZBR_AllocateToken()
 	sprintf finishCall, "ZBR#ZBR_FinishToken(%s)", token
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
 	Execute/P/Q/Z cmd
 	Execute/P/Q/Z finishCall
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return token
 End
@@ -160,10 +194,12 @@ Function/S ZBR_SubmitCommandUnattended(string cmd)
 	token = ZBR_AllocateToken()
 	sprintf finishCall, "ZBR#ZBR_FinishToken(%s)", token
 
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
 	Execute/P/Q/Z "DebuggerOptions enable=0"
 	Execute/P/Q/Z cmd
 	Execute/P/Q/Z restore
 	Execute/P/Q/Z finishCall
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return token
 End
@@ -250,6 +286,9 @@ End
 /// for the crash mitigation this exists for.
 Function ZBR_SubmitReloadAndCompile()
 
+	// anything queued behind COMPILEPROCEDURES is discarded, so the V_flag cleanup is
+	// queued by ZBR_StartHandlerAfterRecompile()
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
 	Execute/P/Q/Z "AUTOCOMPILE OFF "
 	Execute/P/Q/Z "ZBR#ZBR_StopHandlerBeforeRecompile()"
 	Execute/P/Q/Z "RELOAD CHANGED PROCS "
@@ -278,6 +317,9 @@ Function ZBR_StartHandlerAfterRecompile()
 
 	zeromq_handler_start(); err = GetRTError(1)
 	Execute/P/Q/Z "AUTOCOMPILE ON "
+
+	// V_flag cleanup for the Execute/Z entries of ZBR_SubmitReloadAndCompile()
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return 0
 End
