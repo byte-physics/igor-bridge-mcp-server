@@ -28,20 +28,72 @@ static StrConstant ZBR_ZEROMQ_ENV_PORT     = "IGOR_PRO_BRIDGE_PORT"
 
 static StrConstant ZBR_RECOMPILE_WATCHDOG_TASK = "ZBR_RecompileWatchdog"
 
+static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
+static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
+
+/// Commands which only work at the top level of the operation queue or execute further
+/// command strings, see ZBR_QualifyCommand(). The lookahead excludes calls of user functions
+/// with the same name, e.g. CompileProcedures().
+static StrConstant ZBR_TOP_LEVEL_COMMANDS_REGEXP = "(?i)^\\s*(Quit|COMPILEPROCEDURES|RELOAD|AUTOCOMPILE|INSERTINCLUDE|DELETEINCLUDE|NEWEXPERIMENT|LOADFILE|LOADFILEINNEWEXP|MERGEEXPERIMENT)\\b(?!\\s*\\()|\\bExecute\\b"
+
+/// @name Single character checks of ZBR_QualifyCommand()
+///@{
+/// First character of a name
+static StrConstant ZBR_NAME_START_CHAR_REGEXP = "^[A-Za-z_]$"
+/// Following characters of a name, including module qualifications
+static StrConstant ZBR_NAME_CHAR_REGEXP = "^[A-Za-z0-9_#]$"
+/// Characters preceding a character which is not the start of a name, e.g. in data folder
+/// paths or `$` references
+static StrConstant ZBR_NOT_NAME_START_PRECEDING_CHAR_REGEXP = "^[A-Za-z0-9_#:$]$"
+static StrConstant ZBR_WHITESPACE_CHAR_REGEXP               = "^\\s$"
+///@}
+
+static StrConstant ZBR_PACKAGEFOLDER = "root:Packages:ZBR"
+
+static Function/DF ZBR_GetPackageFolder()
+
+	variable i, numItems
+	string partialPath, component
+
+	DFREF dfr = $ZBR_PACKAGEFOLDER
+
+	if(DataFolderRefStatus(dfr))
+		return dfr
+	endif
+
+	partialPath = "root"
+
+	numItems = ItemsInList(ZBR_PACKAGEFOLDER, ":")
+	for(i = 1; i < numItems; i += 1)
+		component = StringFromList(i, ZBR_PACKAGEFOLDER, ":")
+
+		partialPath += ":" + component
+		if(!DataFolderExists(partialPath))
+			NewDataFolder $partialPath
+		endif
+	endfor
+
+	return $ZBR_PACKAGEFOLDER
+End
+
 // --- Storage -------------------------------------------------------------------------
 
 /// Parallel-array storage for in-flight ZBR_SubmitCommand() calls, indexed by row. A
 /// row's index (as a string) is the token handed back to the caller.
 static Function ZBR_EnsureStorage()
 
-	NewDataFolder/O root:Packages
-	NewDataFolder/O root:Packages:ZBR
-	DFREF dfr = root:Packages:ZBR
+	DFREF dfr = ZBR_GetPackageFolder()
 
 	if(!WaveExists(dfr:done))
 		Make/N=0/O dfr:done // 0 = pending, 1 = done
 		Make/N=0/O/T dfr:resultText
 		Make/N=0/O dfr:historyStart
+	endif
+
+	if(!WaveExists(dfr:commandText))
+		WAVE done = dfr:done
+		Make/N=(DimSize(done, 0))/O/T dfr:commandText
+		Make/N=(DimSize(done, 0))/O dfr:errorCode
 	endif
 End
 
@@ -53,14 +105,12 @@ static Function ZBR_EnsureCaptureStarted()
 	string   dummy
 	variable err
 
-	NewDataFolder/O root:Packages
-	NewDataFolder/O root:Packages:ZBR
-
-	NVAR/Z refnum = root:Packages:ZBR:captureRefNum
+	DFREF  dfr    = ZBR_GetPackageFolder()
+	NVAR/Z refnum = dfr:captureRefNum
 	if(!NVAR_Exists(refnum))
-		variable/G root:Packages:ZBR:captureRefNum = CaptureHistoryStart()
+		variable/G dfr:captureRefNum = CaptureHistoryStart()
 	else
-		NVAR refnumRW = root:Packages:ZBR:captureRefNum
+		NVAR refnumRW = dfr:captureRefNum
 
 		try
 			dummy = CaptureHistory(refnumRW, 0); AbortOnRTE
@@ -74,7 +124,8 @@ End
 static Function ZBR_CaptureRefNum()
 
 	ZBR_EnsureCaptureStarted()
-	NVAR refnum = root:Packages:ZBR:captureRefNum
+	DFREF dfr    = ZBR_GetPackageFolder()
+	NVAR  refnum = dfr:captureRefNum
 
 	return refnum
 End
@@ -104,18 +155,203 @@ static Function/S ZBR_AllocateToken()
 	variable n
 
 	ZBR_EnsureStorage()
-	DFREF  dfr          = root:Packages:ZBR
+	DFREF  dfr          = ZBR_GetPackageFolder()
 	WAVE   done         = dfr:done
 	WAVE/T resultText   = dfr:resultText
 	WAVE   historyStart = dfr:historyStart
+	WAVE/T commandText  = dfr:commandText
+	WAVE   errorCode    = dfr:errorCode
 
 	n = DimSize(done, 0)
-	Redimension/N=(n + 1) done, resultText, historyStart
+	Redimension/N=(n + 1) done, resultText, historyStart, commandText, errorCode
 	done[n]         = 0
 	resultText[n]   = ""
 	historyStart[n] = ZBR_HistoryLength()
+	commandText[n]  = ""
+	errorCode[n]    = 0
 
 	return num2istr(n)
+End
+
+/// Returns `cmd` with all calls of ProcGlobal user functions prefixed with `ProcGlobal#`, or
+/// an empty string if the command can only run at the top level of the operation queue
+///
+/// Execute in a function of this independent module resolves names in the context of the
+/// module, so ProcGlobal functions must be qualified. Built-in functions, operations, XOP
+/// functions, waves and variables need no qualification. Macros, unknown names and
+/// commands executing further command strings can not be handled.
+static Function/S ZBR_QualifyCommand(string cmd)
+
+	variable i, j, k, len, inString, type
+	string ch, name, info, result
+
+	if(GrepString(cmd, ZBR_TOP_LEVEL_COMMANDS_REGEXP))
+		return ""
+	endif
+
+	result = ""
+	len    = strlen(cmd)
+	i      = 0
+	do
+		if(i >= len)
+			break
+		endif
+
+		ch = cmd[i]
+
+		if(inString)
+			if(!cmpstr(ch, "\\") && (i + 1) < len)
+				result += cmd[i, i + 1]
+				i      += 2
+				continue
+			endif
+
+			inString = cmpstr(ch, "\"") != 0
+			result  += ch
+			i       += 1
+			continue
+		endif
+
+		if(!cmpstr(ch, "\""))
+			inString = 1
+			result  += ch
+			i       += 1
+			continue
+		endif
+
+		if(!GrepString(ch, ZBR_NAME_START_CHAR_REGEXP) || (i > 0 && GrepString(cmd[i - 1], ZBR_NOT_NAME_START_PRECEDING_CHAR_REGEXP)))
+			result += ch
+			i      += 1
+			continue
+		endif
+
+		// identifier, possibly module qualified
+		j = i + 1
+		for(; j < len; j += 1)
+			if(!GrepString(cmd[j], ZBR_NAME_CHAR_REGEXP))
+				break
+			endif
+		endfor
+		name = cmd[i, j - 1]
+
+		for(k = j; k < len; k += 1)
+			if(!GrepString(cmd[k], ZBR_WHITESPACE_CHAR_REGEXP))
+				break
+			endif
+		endfor
+
+		if(k < len && !cmpstr(cmd[k], "(") && !StringMatch(name, "ProcGlobal#*"))
+			info = FunctionInfo("ProcGlobal#" + name)
+			if(strlen(StringByKey("PROCWIN", info)))
+				name = "ProcGlobal#" + name
+			elseif(strsearch(name, "#", 0) < 0)
+				type = exists(name)
+				// 3: built-in or XOP function, 4: operation
+				if(type != 3 && type != 4)
+					return ""
+				endif
+			endif
+		endif
+
+		result += name
+		i       = j
+	while(1)
+
+	return result
+End
+
+/// Queues the command of the given token
+///
+/// The command is run by ZBR_RunCommand() inside a function, so that Execute/Z creates its
+/// V_flag as local variable. Executed directly via Execute/P/Z, V_flag is created in the
+/// current data folder after the command returned. Background tasks can run before the
+/// next queue entry removes it again, e.g. the reentry of a test case started by the
+/// command, which then finds V_flag in its data folder. Commands which can not be
+/// qualified, see ZBR_QualifyCommand(), are still queued directly.
+static Function ZBR_QueueCommand(string token, string cmd)
+
+	string qualified, entry
+
+	DFREF  dfr         = ZBR_GetPackageFolder()
+	WAVE/T commandText = dfr:commandText
+
+	qualified = ZBR_QualifyCommand(cmd)
+	if(!strlen(qualified))
+		Execute/P/Q/Z cmd
+		return 0
+	endif
+
+	commandText[str2num(token)] = qualified
+	sprintf entry, "ZBR#ZBR_RunCommand(%s)", token
+	Execute/P/Q entry
+
+	return 0
+End
+
+/// Deferred: Run the command of the given token, see ZBR_QueueCommand()
+Function ZBR_RunCommand(variable idx)
+
+	DFREF  dfr         = ZBR_GetPackageFolder()
+	WAVE/T commandText = dfr:commandText
+	WAVE   errorCode   = dfr:errorCode
+
+	if(idx < 0 || idx >= DimSize(commandText, 0))
+		return 0
+	endif
+
+	Execute/Z commandText[idx]
+	errorCode[idx]   = V_flag
+	commandText[idx] = ""
+
+	return 0
+End
+
+/// Deferred: Remember the current data folder, if a global V_flag exists in it and its value.
+Function ZBR_RememberVFlag()
+
+	NVAR/Z vFlag = V_flag
+
+	ZBR_EnsureStorage()
+	DFREF      dfr                    = ZBR_GetPackageFolder()
+	string/G   dfr:vFlagFolder        = GetDataFolder(1)
+	variable/G dfr:vFlagExistedBefore = NVAR_Exists(vFlag)
+	variable/G dfr:vFlagValueBefore   = NVAR_Exists(vFlag) ? vFlag : NaN
+
+	return 0
+End
+
+/// Deferred: Remove the global V_flag created by Execute/Z. If it already existed before,
+/// restore its value instead, see ZBR_RememberVFlag().
+///
+/// The executed command can change the current data folder, e.g. a test case with reentry
+/// returns while its working folder is still current. Execute/Z then creates V_flag in the
+/// new current data folder, which is removed as well.
+Function ZBR_RemoveVFlag()
+
+	string folder
+
+	DFREF dfr = ZBR_GetPackageFolder()
+	folder = StrVarOrDefault(ZBR_PACKAGEFOLDER + ":vFlagFolder", GetDataFolder(1))
+
+	if(CmpStr(folder, GetDataFolder(1)))
+		KillVariables/Z V_flag
+	endif
+
+	if(DataFolderExists(folder))
+		DFREF                 folderDFR = $folder
+		NVAR/Z/SDFR=folderDFR vFlag     = V_flag
+
+		if(!NumVarOrDefault(ZBR_PACKAGEFOLDER + ":vFlagExistedBefore", 1))
+			KillVariables/Z folderDFR:V_flag
+		elseif(NVAR_Exists(vFlag) && exists(ZBR_PACKAGEFOLDER + ":vFlagValueBefore") == 2)
+			vFlag = NumVarOrDefault(ZBR_PACKAGEFOLDER + ":vFlagValueBefore", NaN)
+		endif
+	endif
+
+	KillVariables/Z dfr:vFlagExistedBefore, dfr:vFlagValueBefore
+	KillStrings/Z dfr:vFlagFolder
+
+	return 0
 End
 
 /// Queues `cmd` for deferred execution and returns a token to poll via ZBR_PollCommand().
@@ -127,41 +363,34 @@ Function/S ZBR_SubmitCommand(string cmd)
 
 	token = ZBR_AllocateToken()
 	sprintf finishCall, "ZBR#ZBR_FinishToken(%s)", token
-	Execute/P/Q/Z cmd
-	Execute/P/Q/Z finishCall
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
+	ZBR_QueueCommand(token, cmd)
+	Execute/P/Q finishCall
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return token
 End
 
 /// Same as ZBR_SubmitCommand, but disables Igor's Debugger for `cmd`'s duration and
-/// restores it afterward via persistent globals (plain locals don't survive the
-/// boundary between separate Execute/P entries).
+/// restores it afterward. The current settings are passed to the restoring queue entry,
+/// as plain locals don't survive the boundary between separate Execute/P entries.
 Function/S ZBR_SubmitCommandUnattended(string cmd)
 
+	variable enable, debugOnError, debugOnAbort, nvarChecking
 	string token, finishCall, restore
 
-	DebuggerOptions
-	variable/G root:Packages:ZBR:savedDebugEnable    = V_enable
-	variable/G root:Packages:ZBR:savedDebugOnError   = V_debugOnError
-	variable/G root:Packages:ZBR:savedDebugOnAbort   = V_debugOnAbort
-	variable/G root:Packages:ZBR:savedDebugNvarCheck = V_NVAR_SVAR_WAVE_Checking
-	KillVariables/Z V_enable, V_debugOnError, V_debugOnAbort, V_NVAR_SVAR_WAVE_Checking
-
-	restore  = "DebuggerOptions enable=root:Packages:ZBR:savedDebugEnable, "
-	restore += "debugOnError=root:Packages:ZBR:savedDebugOnError, "
-	restore += "debugOnAbort=root:Packages:ZBR:savedDebugOnAbort, "
-	restore += "NVAR_SVAR_WAVE_Checking=root:Packages:ZBR:savedDebugNvarCheck; "
-	restore += "KillVariables/Z V_enable, V_debugOnError, V_debugOnAbort, V_NVAR_SVAR_WAVE_Checking, "
-	restore += "root:Packages:ZBR:savedDebugEnable, root:Packages:ZBR:savedDebugOnError, "
-	restore += "root:Packages:ZBR:savedDebugOnAbort, root:Packages:ZBR:savedDebugNvarCheck"
+	[enable, debugOnError, debugOnAbort, nvarChecking] = ZBR_GetDebuggerState()
+	sprintf restore, "ZBR#ZBR_RestoreDebuggerSettings(%d, %d, %d, %d)", enable, debugOnError, debugOnAbort, nvarChecking
 
 	token = ZBR_AllocateToken()
 	sprintf finishCall, "ZBR#ZBR_FinishToken(%s)", token
 
-	Execute/P/Q/Z "DebuggerOptions enable=0"
-	Execute/P/Q/Z cmd
-	Execute/P/Q/Z restore
-	Execute/P/Q/Z finishCall
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
+	Execute/P/Q "ZBR#ZBR_SetDebuggerEnabled(0)"
+	ZBR_QueueCommand(token, cmd)
+	Execute/P/Q restore
+	Execute/P/Q finishCall
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return token
 End
@@ -174,13 +403,17 @@ Function ZBR_FinishToken(variable idx)
 	variable err
 	string   errMsg
 
-	DFREF  dfr          = root:Packages:ZBR
+	DFREF  dfr          = ZBR_GetPackageFolder()
 	WAVE   done         = dfr:done
 	WAVE/T resultText   = dfr:resultText
 	WAVE   historyStart = dfr:historyStart
 
 	if(idx >= 0 && idx < DimSize(done, 0))
 		err = GetRTError(1)
+		WAVE/Z errorCode = dfr:errorCode
+		if(!err && WaveExists(errorCode) && idx < DimSize(errorCode, 0))
+			err = errorCode[idx]
+		endif
 		if(err)
 			errMsg = "ERROR: " + GetErrMessage(err) + "\r"
 		else
@@ -199,7 +432,7 @@ Function [variable isDone, string result] ZBR_PollCommand(string token)
 
 	variable idx
 
-	DFREF  dfr        = root:Packages:ZBR
+	DFREF  dfr        = ZBR_GetPackageFolder()
 	WAVE   done       = dfr:done
 	WAVE/T resultText = dfr:resultText
 
@@ -248,6 +481,10 @@ End
 /// for the crash mitigation this exists for.
 Function ZBR_SubmitReloadAndCompile()
 
+	// anything queued behind COMPILEPROCEDURES is discarded, so the V_flag cleanup is
+	// queued by ZBR_StartHandlerAfterRecompile()
+	Execute/P/Q ZBR_REMEMBER_VFLAG_CALL
+	Execute/P/Q/Z "AUTOCOMPILE OFF "
 	Execute/P/Q/Z "ZBR#ZBR_StopHandlerBeforeRecompile()"
 	Execute/P/Q/Z "RELOAD CHANGED PROCS "
 	Execute/P/Q/Z "COMPILEPROCEDURES "
@@ -274,6 +511,10 @@ Function ZBR_StartHandlerAfterRecompile()
 	variable err
 
 	zeromq_handler_start(); err = GetRTError(1)
+	Execute/P/Q/Z "AUTOCOMPILE ON "
+
+	// V_flag cleanup for the Execute/Z entries of ZBR_SubmitReloadAndCompile()
+	Execute/P/Q ZBR_REMOVE_VFLAG_CALL
 
 	return 0
 End
@@ -395,7 +636,8 @@ Function/S ZBR_ReadSessionHistory(variable stop)
 	text = CaptureHistory(refnum, stop)
 
 	if(stop)
-		KillVariables/Z root:Packages:ZBR:captureRefNum
+		DFREF dfr = ZBR_GetPackageFolder()
+		KillVariables/Z dfr:captureRefNum
 	endif
 
 	return text
@@ -520,10 +762,10 @@ End
 /// (Re-)binds this module's ZeroMQ ROUTER socket and starts its handler. Does not call
 /// zeromq_stop() first, so it won't tear down any other ZeroMQ binds in the same
 /// experiment (e.g. MIES's own). Safe to call repeatedly -- an already-bound error is
-/// caught, not propagated. Called only from IgorStartOrNewHook; recompiles instead just
+/// caught, not propagated. Called from IgorStartOrNewHook; recompiles instead just
 /// stop/restart the handler via ZBR_StopHandlerBeforeRecompile/
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
-static Function ZBR_EnsureZeroMQBound()
+Function ZBR_EnsureZeroMQBound()
 
 	variable err, port
 	string bindURL, envPort
