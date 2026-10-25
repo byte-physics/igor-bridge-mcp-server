@@ -169,6 +169,7 @@ import html.parser
 import importlib.metadata
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -615,6 +616,7 @@ def check_compilation_state() -> dict:
 
 
 _COMPILE_POLL_INTERVAL_SECONDS = 0.5
+_COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+: error: .*$", re.MULTILINE)
 _COMPILE_POLL_TIMEOUT_SECONDS = 15.0
 
 
@@ -698,10 +700,10 @@ def reload_and_compile_procedures() -> dict:
     "not ready yet" rather than fatal, since Igor Pro can be briefly unreachable while
     genuinely mid-recompile.
 
-    If this returns "compiled": False, check Igor's history/procedure window directly
-    -- if Igor Pro was launched with /UNATTENDED, a genuine compile error shows up as
-    a plain "<file>:<line>:<col>: error: <message>" line there (readable via
-    read_session_history), rather than a modal dialog. If NOT launched /UNATTENDED, a
+    If this returns "compiled": False, "errors" holds the compile error lines Igor Pro
+    printed during this compile, in its "<file>:<line>:<col>: error: <message>" format --
+    Igor Pro only prints them if it was launched with /UNATTENDED (see
+    launch_igor_pro_unattended), otherwise it shows a modal dialog instead. If NOT launched /UNATTENDED, a
     stuck "Function Compilation Error" dialog is also possible -- this tool tries to
     close it, see also list_igor_windows/close_igor_window. As of v2.3.1, the bridge itself should still be
     reachable in this case (see the watchdog fix above) -- fix the .ipf and call this
@@ -710,12 +712,33 @@ def reload_and_compile_procedures() -> dict:
     return _reload_and_compile()
 
 
+def _history_length():
+    try:
+        return call_function("ZBR#ZBR_GetHistoryLength")
+    except (IgorZmqError, IgorZmqUnreachable):
+        return None
+
+
+def _compile_errors_since(history_start) -> list:
+    """The compile error lines Igor Pro printed to the history since history_start, in its
+    "<file>:<line>:<col>: error: <message>" format (only printed instead of a dialog if
+    Igor Pro was launched with /UNATTENDED)."""
+    if history_start is None:
+        return []
+    try:
+        text = call_function("ZBR#ZBR_GetHistorySince", [history_start])
+    except (IgorZmqError, IgorZmqUnreachable):
+        return []
+    return _COMPILE_ERROR_REGEXP.findall((text or "").replace("\r", "\n"))
+
+
 def _reload_and_compile(before_submit=None) -> dict:
     """Run the reload/compile flow of reload_and_compile_procedures and return its result.
 
     before_submit, if given, is called right before the reload/compile is queued, e.g. to
     queue an INSERTINCLUDE that the same compile then picks up."""
     baseline_counter = _read_compile_counter()
+    history_start = _history_length()
 
     if before_submit is not None:
         before_submit()
@@ -753,9 +776,11 @@ def _reload_and_compile(before_submit=None) -> dict:
             break
         time.sleep(_COMPILE_POLL_INTERVAL_SECONDS)
 
+    errors = _compile_errors_since(history_start)
     dismiss_result = _attempt_dismiss_compile_error_dialog()
     return {
         "compiled": False,
+        "errors": errors,
         "poll_attempts": attempts,
         "auto_dismiss_attempted": dismiss_result,
         "note": (
