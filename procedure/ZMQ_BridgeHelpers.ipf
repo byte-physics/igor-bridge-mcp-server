@@ -596,6 +596,14 @@ Function ZBR_IsCompiled()
 	return strlen(FunctionInfo("ProcGlobal#ZBR_DefinitelyNotARealFunctionName_8f3a1c")) == 0
 End
 
+/// True from ZBR_SubmitReloadAndCompile() until the recompile watchdog restarted the
+/// handler after the compile, successful or not. Until then ZBR_IsCompiled() may still
+/// report the state before the queued reload/compile ran.
+Function ZBR_IsRecompilePending()
+
+	return NumVarOrDefault(ZBR_PACKAGEFOLDER + ":recompilePending", 0)
+End
+
 /// Reads compileCounter of the package folder (bumped by AfterCompiledHook on every
 /// successful compile) without creating it. Returns -1 if not yet created.
 Function ZBR_ReadCompileCounter()
@@ -609,6 +617,10 @@ End
 /// queued behind COMPILEPROCEDURES is discarded by the recompile. See SESSION_NOTES.md
 /// for the crash mitigation this exists for.
 Function ZBR_SubmitReloadAndCompile()
+
+	// set right away, before the queue runs, see ZBR_IsRecompilePending()
+	DFREF      dfr                  = ZBR_GetPackageFolder()
+	variable/G dfr:recompilePending = 1
 
 	// anything queued behind COMPILEPROCEDURES is discarded, so the V_flag cleanup is
 	// queued by ZBR_StartHandlerAfterRecompile()

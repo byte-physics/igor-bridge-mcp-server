@@ -823,15 +823,19 @@ def _reload_and_compile(before_submit=None) -> dict:
                 "confirmed_via": "AfterCompiledHook counter (ZBR_ReadCompileCounter)",
             }
 
+        # Before the queued reload/compile ran, ZBR_IsCompiled() still reports the state
+        # before it, so it only decides once the compile is over.
         try:
-            if call_function("ZBR#ZBR_IsCompiled"):
-                return {
-                    "compiled": True,
-                    "poll_attempts": attempts,
-                    "confirmed_via": "ZBR_IsCompiled",
-                }
+            if not call_function("ZBR#ZBR_IsRecompilePending"):
+                if call_function("ZBR#ZBR_IsCompiled"):
+                    return {
+                        "compiled": True,
+                        "poll_attempts": attempts,
+                        "confirmed_via": "ZBR_IsCompiled",
+                    }
+                break
         except (IgorZmqError, IgorZmqUnreachable):
-            pass  # treat as "not ready yet", same as a False result
+            pass  # treat as "not ready yet", e.g. while the handler is stopped
 
         if time.monotonic() >= deadline:
             break
@@ -845,12 +849,11 @@ def _reload_and_compile(before_submit=None) -> dict:
         "poll_attempts": attempts,
         "auto_dismiss_attempted": dismiss_result,
         "note": (
-            f"Still not compiled after polling for {_COMPILE_POLL_TIMEOUT_SECONDS:.0f}s. "
-            "This is more likely a genuine compile error than a timing artifact -- "
-            "check Igor's history/procedure window directly (or call "
-            "read_session_history() if launched with /UNATTENDED, see the "
-            "'<file>:<line>:<col>: error: ...' line reported there), or check for a "
-            "stuck compile-error dialog (see 'auto_dismiss_attempted' above)."
+            "Not compiled. See 'errors' for the '<file>:<line>:<col>: error: ...' lines of "
+            "Igor's history (Igor Pro launched with /UNATTENDED prints them there instead of "
+            "showing a dialog), or check for a stuck compile-error dialog (see "
+            "'auto_dismiss_attempted' above). If 'errors' is empty and Igor Pro did not "
+            f"answer within {_COMPILE_POLL_TIMEOUT_SECONDS:.0f}s, see check_bridge_health."
         ),
     }
 
