@@ -803,7 +803,18 @@ def reload_and_compile_procedures() -> dict:
     reachable in this case (see the watchdog fix above) -- fix the .ipf and call this
     tool again rather than needing to relaunch Igor Pro.
     """
+    return _reload_and_compile()
+
+
+def _reload_and_compile(before_submit=None) -> dict:
+    """Run the reload/compile flow of reload_and_compile_procedures and return its result.
+
+    before_submit, if given, is called right before the reload/compile is queued, e.g. to
+    queue an INSERTINCLUDE that the same compile then picks up."""
     baseline_counter = _read_compile_counter()
+
+    if before_submit is not None:
+        before_submit()
 
     call_function("ZBR#ZBR_SubmitReloadAndCompile")
 
@@ -852,6 +863,164 @@ def reload_and_compile_procedures() -> dict:
             "stuck compile-error dialog (see 'auto_dismiss_attempted' above)."
         ),
     }
+
+
+# --- Scratch procedures (run_igor_code) ----------------------------------------------
+#
+# Code that needs more than Igor's command line offers (flow control, local variables,
+# assigning results of functions, the experiment's constants) is written into
+# ZBR_Scratch.ipf and run as a function. That file is included by ZBR_ProcGlobal.ipf, both
+# live in procedure/ZBR_UserProcedures/ next to ZMQ_BridgeHelpers.ipf. The folder is linked
+# into Igor's "User Procedures" folder, so INSERTINCLUDE finds it, and both files compile
+# in ProcGlobal like the experiment's own code. With ZBR_ProcGlobal.ipf included, commands
+# of execute_igor_command run in ProcGlobal context as well, see ZBR_QueueCommand().
+
+_SCRATCH_FILE_NAME = "ZBR_Scratch.ipf"
+_SCRATCH_MAIN_FUNCTION = "ZBR_Scratch_Main"
+_SCRATCH_HEADER = (
+    "#pragma rtFunctionErrors = 1\n"
+    '#pragma TextEncoding     = "UTF-8"\n'
+    "#pragma rtGlobals        = 3\n"
+    "\n"
+    "// Written by the Igor Pro Bridge (run_igor_code), every call replaces the contents.\n"
+)
+
+
+def _scratch_file_path() -> str:
+    """Native path of ZBR_Scratch.ipf, resolved Igor-side from the location of
+    ZMQ_BridgeHelpers.ipf, see ZBR_GetUserProceduresFolder()."""
+    folder = call_function("ZBR#ZBR_GetUserProceduresFolder")
+    if not folder or not os.path.isdir(folder):
+        raise RuntimeError(
+            f"The folder for the scratch procedures ({folder!r}) does not exist. It must be "
+            "the folder procedure/ZBR_UserProcedures next to ZMQ_BridgeHelpers.ipf, see the "
+            "installation steps in README.md."
+        )
+    return os.path.join(folder, _SCRATCH_FILE_NAME)
+
+
+def _write_scratch_file(contents: str) -> str:
+    path = _scratch_file_path()
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(_SCRATCH_HEADER + contents)
+    return path
+
+
+def _running_background_tasks() -> list:
+    tasks = call_function("ZBR#ZBR_GetRunningBackgroundTasks") or ""
+    return [t for t in tasks.split(";") if t]
+
+
+def _compile_with_scratch(contents: str) -> dict:
+    """Write `contents` into ZBR_Scratch.ipf, make sure ZBR_ProcGlobal.ipf is included and
+    compile. On a compile error the scratch file is emptied and compiled again, so the
+    experiment does not stay uncompiled, and the result of the failed compile is returned."""
+    _write_scratch_file(contents)
+
+    def _insert_if_needed():
+        if not call_function("ZBR#ZBR_ProcGlobalIsInInclude"):
+            call_function("ZBR#ZBR_SubmitInsertProcGlobal")
+
+    result = _reload_and_compile(before_submit=_insert_if_needed)
+    if result.get("compiled"):
+        return result
+
+    _write_scratch_file("")
+    recovery = _reload_and_compile()
+    result["recompiled_without_scratch_code"] = recovery.get("compiled", False)
+    return result
+
+
+@mcp.tool()
+def run_igor_code(
+    code: str = "",
+    functions: str = "",
+    call: str = "",
+    timeout_seconds: float = _SUBMIT_POLL_TIMEOUT_SECONDS,
+    force: bool = False,
+) -> dict:
+    """Compile and run procedure code in Igor Pro -- the default way to run anything
+    beyond a trivial one-line command.
+
+    `code` is the body of a function, which this tool wraps into
+    `Function ZBR_Scratch_Main() ... End` and calls. `functions` holds complete function
+    definitions (constants, structures, helper functions) placed before it. `call`
+    overrides what is run afterward, e.g. `"MyHelper(1, 2)"` for a function from
+    `functions`; it defaults to `ZBR_Scratch_Main()`. Use `print` to return data.
+
+    Unlike execute_igor_command, the code runs as compiled function code in ProcGlobal: flow
+    control, local variables, WAVE/NVAR/SVAR references, multiple return syntax and the
+    experiment's own constants and functions all work, and the result of a built-in
+    function does not need the command line's workarounds.
+
+    Mechanism: the code is written to ZBR_Scratch.ipf in procedure/ZBR_UserProcedures/ (next
+    to ZMQ_BridgeHelpers.ipf). ZBR_ProcGlobal.ipf, which includes it, is added to the
+    experiment with INSERTINCLUDE on first use -- this adds an `#include` line to the
+    experiment's Procedure window, see remove_scratch_procedures to take it out again. Every
+    call replaces the scratch file and recompiles all procedures.
+
+    **Recompiling stops procedure code running in background tasks**, e.g. a data
+    acquisition. If any named background task (other than the bridge's own) is running,
+    this refuses and lists them, unless `force` is True. Already compiled helpers can still
+    be called with execute_igor_command while they run.
+
+    On a compile error, the scratch file is emptied and the procedures are compiled again,
+    so the experiment does not stay uncompiled. The returned "compile" entry then holds the
+    compile result, including any error lines.
+
+    Returns {"compiled": bool, "output": captured history text, "error": runtime error
+    message or ""}, plus "compile" with the details of the compile step.
+    """
+    if not code and not call:
+        raise RuntimeError("Pass `code` (a function body) and/or `call`.")
+
+    if not force:
+        tasks = _running_background_tasks()
+        if tasks:
+            return {
+                "compiled": False,
+                "refused": True,
+                "running_background_tasks": tasks,
+                "note": (
+                    "Recompiling would stop these background tasks. Pass force=True to "
+                    "compile anyway, or call already compiled code via execute_igor_command."
+                ),
+            }
+
+    contents = functions.strip() + "\n" if functions.strip() else ""
+    if code:
+        contents += f"\nFunction {_SCRATCH_MAIN_FUNCTION}()\n\n{code}\nEnd\n"
+
+    compile_result = _compile_with_scratch(contents)
+    if not compile_result.get("compiled"):
+        return {"compiled": False, "output": "", "error": "", "compile": compile_result}
+
+    command = call or f"{_SCRATCH_MAIN_FUNCTION}()"
+    text = _submit_and_poll("ZBR_SubmitCommandUnattended", command, timeout_seconds)
+    error = ""
+    if text.startswith("ERROR: "):
+        first, _, text = text.partition("\r")
+        error = first[len("ERROR: ") :]
+
+    return {"compiled": True, "output": text, "error": error, "compile": compile_result}
+
+
+@mcp.tool()
+def remove_scratch_procedures() -> dict:
+    """Remove the include of ZBR_ProcGlobal.ipf (and so ZBR_Scratch.ipf) from the experiment
+    again, which run_igor_code added with INSERTINCLUDE, and recompile.
+
+    Use this before saving an experiment that should not reference the bridge's procedure
+    files. Commands of execute_igor_command run in the bridge's own module context
+    afterward, see its docstring."""
+    if not call_function("ZBR#ZBR_ProcGlobalIsInInclude"):
+        return {"removed": False, "note": "ZBR_ProcGlobal.ipf is not included."}
+
+    _write_scratch_file("")
+    result = _reload_and_compile(
+        before_submit=lambda: call_function("ZBR#ZBR_SubmitDeleteProcGlobal")
+    )
+    return {"removed": True, "compile": result}
 
 
 # --- Debugger control --------------------------------------------------------------

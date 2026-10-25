@@ -55,6 +55,8 @@ Claude Desktop session running on the same Windows machine as Igor Pro.
    5. navigate to the output\win\x64\xop\Release subfolder from the unpacked XOP
    6. Put a shortcut to `ZeroMQ-64.xop` in the `Igor Extensions (64-bit)` folder
    7. Put a shortcut to the `procedure\ZMQ_BridgeHelpers.ipf` file in the `Igor Procedures` folder
+   8. Put a shortcut to the `procedure\ZBR_UserProcedures` folder in the `User Procedures` folder.
+      The bridge includes `ZBR_ProcGlobal.ipf` from there on demand (`run_igor_code`), see below.
 
 2. **Install the pinned Python dependencies**, into the same Python
    environment Claude Desktop itself resolves when it launches the bridge:
@@ -95,8 +97,10 @@ It is worthwhile to hint Claude that it should read the Igor Help for specific t
 
 The mcp folder includes some session notes to help Claude.
 
-Allow Claude to create and include an own procedure file for scratch code, like small utility functions that Claude can create and run.
-This enables much more powerful tooling than just running commands or calling already present function code.
+`run_igor_code` compiles and runs scratch code as functions in ProcGlobal, e.g. small utility functions.
+The code is written to `procedure\ZBR_UserProcedures\ZBR_Scratch.ipf`, which `ZBR_ProcGlobal.ipf` includes. On first use the bridge
+adds `ZBR_ProcGlobal.ipf` to the experiment with `INSERTINCLUDE`; `remove_scratch_procedures` takes it out again.
+While it is included, commands run in ProcGlobal context as well, so the experiment's constants and functions resolve as on Igor's own command line.
 
 The MCP Bridge is able to run multiple instances of Igor Pro with different ports for ZeroMQ communication.
 You can ask Claude to start a new Igor Pro instance with a custom port. (default is 5680)

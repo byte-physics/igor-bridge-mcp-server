@@ -50,6 +50,13 @@ static StrConstant ZBR_WHITESPACE_CHAR_REGEXP               = "^\\s$"
 
 static StrConstant ZBR_PACKAGEFOLDER = "root:Packages:ZBR"
 
+/// @name ProcGlobal part of the bridge, see ZBR_UserProcedures/ZBR_ProcGlobal.ipf
+///@{
+static StrConstant ZBR_USER_PROCEDURES_FOLDER = "ZBR_UserProcedures"
+static StrConstant ZBR_PROCGLOBAL_FILE        = "ZBR_ProcGlobal"
+static StrConstant ZBR_PROCGLOBAL_RUN_COMMAND = "ZBR_PG_RunCommand"
+///@}
+
 static Function/DF ZBR_GetPackageFolder()
 
 	variable i, numItems
@@ -133,6 +140,18 @@ End
 static Function ZBR_HistoryLength()
 
 	return strlen(CaptureHistory(ZBR_CaptureRefNum(), 0))
+End
+
+/// Return the current length of the captured history, see ZBR_GetHistorySince()
+Function ZBR_GetHistoryLength()
+
+	return ZBR_HistoryLength()
+End
+
+/// Return the history text captured after `startLen`, see ZBR_GetHistoryLength()
+Function/S ZBR_GetHistorySince(variable startLen)
+
+	return ZBR_HistorySince(startLen)
 End
 
 static Function/S ZBR_HistorySince(variable startLen)
@@ -268,12 +287,32 @@ End
 /// next queue entry removes it again, e.g. the reentry of a test case started by the
 /// command, which then finds V_flag in its data folder. Commands which can not be
 /// qualified, see ZBR_QualifyCommand(), are still queued directly.
+///
+/// If the ProcGlobal part of the bridge is included, see ZBR_ProcGlobalIncluded(), the command
+/// runs in ProcGlobal context via ZBR_PG_RunCommand(), so constants, functions and macros are
+/// resolved as on Igor's own command line. Otherwise it runs in the context of this module,
+/// where only calls of ProcGlobal functions can be qualified, see ZBR_QualifyCommand().
+///
+/// All queue entries use Execute/P/Z, so an error never opens a modal dialog, which would block
+/// the bridge until it is closed by hand.
 static Function ZBR_QueueCommand(string token, string cmd)
 
 	string qualified, entry
 
 	DFREF  dfr         = ZBR_GetPackageFolder()
 	WAVE/T commandText = dfr:commandText
+
+	if(GrepString(cmd, ZBR_TOP_LEVEL_COMMANDS_REGEXP))
+		Execute/P/Q/Z cmd
+		return 0
+	endif
+
+	if(ZBR_ProcGlobalIncluded())
+		commandText[str2num(token)] = cmd
+		sprintf entry, "%s(%s)", ZBR_PROCGLOBAL_RUN_COMMAND, token
+		Execute/P/Q/Z entry
+		return 0
+	endif
 
 	qualified = ZBR_QualifyCommand(cmd)
 	if(!strlen(qualified))
@@ -283,9 +322,84 @@ static Function ZBR_QueueCommand(string token, string cmd)
 
 	commandText[str2num(token)] = qualified
 	sprintf entry, "ZBR#ZBR_RunCommand(%s)", token
-	Execute/P/Q entry
+	Execute/P/Q/Z entry
 
 	return 0
+End
+
+// --- ProcGlobal part ---------------------------------------------------------------------
+
+/// Return 1 if ZBR_ProcGlobal.ipf is included and compiled, 0 otherwise
+Function ZBR_ProcGlobalIncluded()
+
+	return strlen(StringByKey("PROCWIN", FunctionInfo("ProcGlobal#" + ZBR_PROCGLOBAL_RUN_COMMAND))) > 0
+End
+
+/// Return 1 if ZBR_ProcGlobal.ipf is included in the experiment, compiled or not
+Function ZBR_ProcGlobalIsInInclude()
+
+	return strlen(WinList(ZBR_PROCGLOBAL_FILE + ".ipf", ";", "WIN:128")) > 0
+End
+
+/// Return the native path of the folder holding ZBR_ProcGlobal.ipf and ZBR_Scratch.ipf
+///
+/// The folder is a sibling of this procedure file. Its link in the "User Procedures" folder
+/// makes it findable for #include and INSERTINCLUDE.
+Function/S ZBR_GetUserProceduresFolder()
+
+	string path = FunctionPath("ZBR#ZBR_Ping")
+
+	if(!strlen(path))
+		return ""
+	endif
+
+	path = ParseFilePath(1, path, ":", 1, 0) + ZBR_USER_PROCEDURES_FOLDER + ":"
+
+	return ParseFilePath(5, path, "\\", 0, 0)
+End
+
+/// Queue the include of ZBR_ProcGlobal.ipf into the experiment. Compiling is up to the caller,
+/// see ZBR_SubmitReloadAndCompile().
+Function ZBR_SubmitInsertProcGlobal()
+
+	Execute/P/Q/Z "INSERTINCLUDE \"" + ZBR_PROCGLOBAL_FILE + "\""
+
+	return 0
+End
+
+/// Queue the removal of the include of ZBR_ProcGlobal.ipf from the experiment. Compiling is up to
+/// the caller, see ZBR_SubmitReloadAndCompile().
+Function ZBR_SubmitDeleteProcGlobal()
+
+	Execute/P/Q/Z "DELETEINCLUDE \"" + ZBR_PROCGLOBAL_FILE + "\""
+
+	return 0
+End
+
+/// Return the names of the running named background tasks, except the ones of this module
+///
+/// Recompiling stops procedure code which runs in background tasks, e.g. a data acquisition,
+/// so callers can refuse to recompile while these run.
+Function/S ZBR_GetRunningBackgroundTasks()
+
+	variable i, numTasks
+	string info, name
+	string list = ""
+
+	CtrlNamedBackground _all_, status
+	numTasks = ItemsInList(S_info, "\r")
+	for(i = 0; i < numTasks; i += 1)
+		info = StringFromList(i, S_info, "\r")
+		name = StringByKey("NAME", info)
+		if(!strlen(name) || StringMatch(name, "ZBR_*"))
+			continue
+		endif
+		if(NumberByKey("RUN", info) == 1)
+			list = AddListItem(name, list, ";", Inf)
+		endif
+	endfor
+
+	return list
 End
 
 /// Deferred: Run the command of the given token, see ZBR_QueueCommand()
