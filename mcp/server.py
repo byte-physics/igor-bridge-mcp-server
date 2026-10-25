@@ -971,6 +971,48 @@ def remove_scratch_procedures() -> dict:
     return {"removed": True, "compile": result}
 
 
+_EXISTS_MEANINGS = {
+    0: "unknown name (also constants, which exists() does not report)",
+    1: "wave",
+    2: "numeric or string variable",
+    3: "built-in or external (XOP) function",
+    4: "operation",
+    5: "macro",
+    6: "user-defined function",
+}
+
+
+@mcp.tool()
+def get_igor_symbol_info(name: str) -> dict:
+    """Look up a name in ProcGlobal context, i.e. as the experiment's own code sees it:
+    `exists(name)` and, for functions, `FunctionInfo(name)` (procedure file, line, parameters).
+
+    Use this instead of running `exists()`/`FunctionInfo()` through execute_igor_command
+    without the scratch procedures: there they run in the bridge's own independent module
+    and report 0/nothing for the experiment's functions. Needs ZBR_ProcGlobal.ipf, which
+    run_igor_code includes; without it only "function_info" is available.
+
+    Returns {"exists": code, "meaning": text, "function_info": {key: value}}."""
+    if call_function("ZBR#ZBR_ProcGlobalIncluded"):
+        raw = call_function("ZBR_PG_SymbolInfo", [name])
+    else:
+        raw = "EXISTS:;" + (call_function("ZBR#ZBR_FunctionInfo", ["ProcGlobal#" + name]) or "")
+
+    info = {}
+    for item in (raw or "").split(";"):
+        key, sep, value = item.partition(":")
+        if sep:
+            info[key] = value
+
+    exists_raw = info.pop("EXISTS", "")
+    exists = int(exists_raw) if exists_raw.strip().lstrip("-").isdigit() else None
+    return {
+        "exists": exists,
+        "meaning": _EXISTS_MEANINGS.get(exists, "not available without ZBR_ProcGlobal.ipf"),
+        "function_info": info,
+    }
+
+
 # --- Tests (IgorTest) -----------------------------------------------------------------
 #
 # A test run of IgorTest (https://github.com/byte-physics/igortest) often outlives a single

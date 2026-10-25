@@ -50,6 +50,10 @@
       "description": "Remove the bridge's scratch procedures (INSERTINCLUDE) from the experiment again"
     },
     {
+      "name": "get_igor_symbol_info",
+      "description": "Look up a name with exists() and FunctionInfo() in ProcGlobal context"
+    },
+    {
       "name": "run_igor_tests",
       "description": "Compile and start a test run of IgorTest, returning immediately"
     },
