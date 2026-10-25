@@ -9,29 +9,39 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
 
 ## Key functions
 
-- **Run commands** — `execute_igor_command` / `execute_igor_command_unattended`
-  run a command string on Igor's command line and return what it printed
-  (`_unattended` also disables/restores Igor's Debugger around the call, so a
-  runtime error can't pop an undismissable modal dialog).
-- **Long-running commands** — `submit_igor_command` / `submit_igor_command_unattended`
-  queue a command and return a token immediately without waiting; `poll_igor_command`
-  checks completion later. Reliable across bridge/Claude Desktop restarts, and
-  across waits of any length (hours to weeks), since all state lives in Igor
-  Pro's own data waves, not in this bridge's process.
+- **Run code** — `run_igor_code` compiles and runs procedure code as a ProcGlobal
+  function (flow control, local variables, the experiment's own constants and functions).
+  It is the default way to run anything beyond a short command.
+- **Run commands** — `execute_igor_command` runs a command line and returns what it
+  printed and its error message. By default Igor's Debugger is disabled for the call,
+  so a Debugger pause can't hang it; errors never open a modal dialog.
+- **Long-running commands** — `submit_igor_command` queues a command and returns a
+  token immediately without waiting; `poll_igor_command` checks completion later.
+  Reliable across bridge/Claude Desktop restarts, and across waits of any length
+  (hours to weeks), since all state lives in Igor Pro's own data waves, not in this
+  bridge's process.
+- **Tests** — `run_igor_tests` compiles changed procedures and starts a test run of
+  [IgorTest](https://github.com/byte-physics/igortest); `get_igor_test_results` returns
+  its results from the JUnit output once the run has finished.
 - **Read data back** — `get_wave` returns an existing wave's full data and
   metadata (any dimensionality, numeric/complex/text/wave-reference).
   `read_session_history` reads back everything sent to Igor's history area.
 - **Compilation management** — `check_compilation_state` /
   `reload_and_compile_procedures` check and refresh Igor's compiled state
-  after editing a `.ipf` file on disk; `dismiss_compile_error_dialog` closes a
-  stuck "Function Compilation Error" dialog without needing OS focus.
+  after editing a `.ipf` file on disk.
+- **Windows and dialogs** — `list_igor_windows` lists Igor's top-level windows,
+  e.g. a modal dialog blocking the bridge; `close_igor_window` closes one
+  (WM_CLOSE, Escape, and only on request Enter, which selects the default
+  button) and `send_key_to_igor_window` sends a key, both without needing OS
+  focus. `check_bridge_health` reports such dialogs.
 - **Debugger control** — `get_debugger_state` / `set_debugger_enabled` /
   `restore_debugger_settings` read, change, and restore Igor's Debugger
   settings (must be disabled for unattended/automated use).
 - **Environment inspection** — `get_environment_summary` summarizes the live
   instance (version, loaded experiment, XOPs, included procedure files, data
   folders, Debugger settings). `read_help_file` reads an Igor help file
-  (`.ihf`) as structured text. `get_bridge_version` reports the running
+  (`.ihf`) as structured text, optionally with character styles, and caches it;
+  `edit_help_file` edits a help file with Notebook operations and verifies its topics. `get_bridge_version` reports the running
   bridge/Python/package versions.
 - **Launching and switching instances** — `configure_igor_launch` records the
   Igor Pro executable path to use, and optionally a custom ZeroMQ port (for
@@ -55,6 +65,8 @@ Claude Desktop session running on the same Windows machine as Igor Pro.
    5. navigate to the output\win\x64\xop\Release subfolder from the unpacked XOP
    6. Put a shortcut to `ZeroMQ-64.xop` in the `Igor Extensions (64-bit)` folder
    7. Put a shortcut to the `procedure\ZMQ_BridgeHelpers.ipf` file in the `Igor Procedures` folder
+   8. Put a shortcut to the `procedure\ZBR_UserProcedures` folder in the `User Procedures` folder.
+      The bridge includes `ZBR_ProcGlobal.ipf` from there on demand (`run_igor_code`), see below.
 
 2. **Install the pinned Python dependencies**, into the same Python
    environment Claude Desktop itself resolves when it launches the bridge:
@@ -70,7 +82,7 @@ Claude Desktop session running on the same Windows machine as Igor Pro.
    `Get-Help ./install.ps1 -Full` for details.
 
 3. **Install the Claude Desktop extension (`.mcpb`)**. A pre-built package is
-   included at `mcp/igor-pro-bridge-2.3.2.mcpb`. In Claude Desktop, go to
+   included at `mcp/igor-pro-bridge-<version>.mcpb` (build a new one with `mcpb pack mcp`). In Claude Desktop, go to
    Settings → Extensions → Advanced settings → Extension Developer → Install
    Extension, and select that file. Do not register this bridge by manually
    editing `claude_desktop_config.json` — that does not work reliably for
@@ -91,12 +103,30 @@ The general idea is that you have some repository / folder where your .ipf files
 Then it can edit these files on disk and reload the changes in Igor Pro and recompile.
 It is worthwhile to hint Claude that it should read the Igor Help for specific tasks first as it has a dedicated function for this included.
 
+## Working with the bridge
+
+- **`run_igor_code` is the default for running code.** It runs as a compiled ProcGlobal function:
+  flow control, local variables, WAVE/NVAR/SVAR references and the experiment's own constants and
+  functions all work. Use `print` to return data.
+- **`execute_igor_command` is for quick queries** and for what only works outside functions, e.g.
+  `Quit` or `Execute/P ...`. On Igor's command line, results of built-in functions must be printed or
+  assigned, there is no flow control, and SVAR/NVAR/WAVE references are not allowed.
+- **Recompiling stops background tasks.** `run_igor_code` recompiles every time and refuses while
+  named background tasks run (e.g. a data acquisition); call already compiled code with
+  `execute_igor_command` then.
+- **Reload before tests.** `run_igor_tests` compiles changed procedure files first, otherwise Igor Pro
+  goes uncompiled in the middle of the run when it notices them.
+- **When the bridge does not answer**, `check_bridge_health` tells whether Igor Pro runs, is busy or
+  shows a dialog; `list_igor_windows`/`close_igor_window` close such dialogs.
+
 ## Advanced Use
 
 The mcp folder includes some session notes to help Claude.
 
-Allow Claude to create and include an own procedure file for scratch code, like small utility functions that Claude can create and run.
-This enables much more powerful tooling than just running commands or calling already present function code.
+`run_igor_code` compiles and runs scratch code as functions in ProcGlobal, e.g. small utility functions.
+The code is written to `procedure\ZBR_UserProcedures\ZBR_Scratch.ipf`, which `ZBR_ProcGlobal.ipf` includes. On first use the bridge
+adds `ZBR_ProcGlobal.ipf` to the experiment with `INSERTINCLUDE`; `remove_scratch_procedures` takes it out again.
+While it is included, commands run in ProcGlobal context as well, so the experiment's constants and functions resolve as on Igor's own command line.
 
 The MCP Bridge is able to run multiple instances of Igor Pro with different ports for ZeroMQ communication.
 You can ask Claude to start a new Igor Pro instance with a custom port. (default is 5680)

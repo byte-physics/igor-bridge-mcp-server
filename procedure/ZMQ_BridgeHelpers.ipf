@@ -27,6 +27,10 @@ static Constant    ZBR_ZEROMQ_DEFAULT_PORT = 5680
 static StrConstant ZBR_ZEROMQ_ENV_PORT     = "IGOR_PRO_BRIDGE_PORT"
 
 static StrConstant ZBR_RECOMPILE_WATCHDOG_TASK = "ZBR_RecompileWatchdog"
+static StrConstant ZBR_BIND_KEEPER_TASK        = "ZBR_BindKeeper"
+static Constant    ZBR_BIND_KEEPER_PERIOD      = 600 ///< [ticks], 10 s
+static StrConstant ZBR_REBIND_REQUEST_FOLDER   = "igor-pro-bridge"
+static StrConstant ZBR_REBIND_REQUEST_FILE     = "rebind-request-"
 
 static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
 static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
@@ -49,6 +53,13 @@ static StrConstant ZBR_WHITESPACE_CHAR_REGEXP               = "^\\s$"
 ///@}
 
 static StrConstant ZBR_PACKAGEFOLDER = "root:Packages:ZBR"
+
+/// @name ProcGlobal part of the bridge, see ZBR_UserProcedures/ZBR_ProcGlobal.ipf
+///@{
+static StrConstant ZBR_USER_PROCEDURES_FOLDER = "ZBR_UserProcedures"
+static StrConstant ZBR_PROCGLOBAL_FILE        = "ZBR_ProcGlobal"
+static StrConstant ZBR_PROCGLOBAL_RUN_COMMAND = "ZBR_PG_RunCommand"
+///@}
 
 static Function/DF ZBR_GetPackageFolder()
 
@@ -133,6 +144,18 @@ End
 static Function ZBR_HistoryLength()
 
 	return strlen(CaptureHistory(ZBR_CaptureRefNum(), 0))
+End
+
+/// Return the current length of the captured history, see ZBR_GetHistorySince()
+Function ZBR_GetHistoryLength()
+
+	return ZBR_HistoryLength()
+End
+
+/// Return the history text captured after `startLen`, see ZBR_GetHistoryLength()
+Function/S ZBR_GetHistorySince(variable startLen)
+
+	return ZBR_HistorySince(startLen)
 End
 
 static Function/S ZBR_HistorySince(variable startLen)
@@ -268,12 +291,32 @@ End
 /// next queue entry removes it again, e.g. the reentry of a test case started by the
 /// command, which then finds V_flag in its data folder. Commands which can not be
 /// qualified, see ZBR_QualifyCommand(), are still queued directly.
+///
+/// If the ProcGlobal part of the bridge is included, see ZBR_ProcGlobalIncluded(), the command
+/// runs in ProcGlobal context via ZBR_PG_RunCommand(), so constants, functions and macros are
+/// resolved as on Igor's own command line. Otherwise it runs in the context of this module,
+/// where only calls of ProcGlobal functions can be qualified, see ZBR_QualifyCommand().
+///
+/// All queue entries use Execute/P/Z, so an error never opens a modal dialog, which would block
+/// the bridge until it is closed by hand.
 static Function ZBR_QueueCommand(string token, string cmd)
 
 	string qualified, entry
 
 	DFREF  dfr         = ZBR_GetPackageFolder()
 	WAVE/T commandText = dfr:commandText
+
+	if(GrepString(cmd, ZBR_TOP_LEVEL_COMMANDS_REGEXP))
+		Execute/P/Q/Z cmd
+		return 0
+	endif
+
+	if(ZBR_ProcGlobalIncluded())
+		commandText[str2num(token)] = cmd
+		sprintf entry, "%s(%s)", ZBR_PROCGLOBAL_RUN_COMMAND, token
+		Execute/P/Q/Z entry
+		return 0
+	endif
 
 	qualified = ZBR_QualifyCommand(cmd)
 	if(!strlen(qualified))
@@ -283,9 +326,95 @@ static Function ZBR_QueueCommand(string token, string cmd)
 
 	commandText[str2num(token)] = qualified
 	sprintf entry, "ZBR#ZBR_RunCommand(%s)", token
-	Execute/P/Q entry
+	Execute/P/Q/Z entry
 
 	return 0
+End
+
+/// Return the native path of the experiment's home folder, or "" for an unsaved experiment
+Function/S ZBR_GetHomePath()
+
+	PathInfo home
+	if(!V_flag)
+		return ""
+	endif
+
+	return ParseFilePath(5, S_path, "\\", 0, 0)
+End
+
+// --- ProcGlobal part ---------------------------------------------------------------------
+
+/// Return 1 if ZBR_ProcGlobal.ipf is included and compiled, 0 otherwise
+Function ZBR_ProcGlobalIncluded()
+
+	return strlen(StringByKey("PROCWIN", FunctionInfo("ProcGlobal#" + ZBR_PROCGLOBAL_RUN_COMMAND))) > 0
+End
+
+/// Return 1 if ZBR_ProcGlobal.ipf is included in the experiment, compiled or not
+Function ZBR_ProcGlobalIsInInclude()
+
+	return strlen(WinList(ZBR_PROCGLOBAL_FILE + ".ipf", ";", "WIN:128")) > 0
+End
+
+/// Return the native path of the folder holding ZBR_ProcGlobal.ipf and ZBR_Scratch.ipf
+///
+/// The folder is a sibling of this procedure file. Its link in the "User Procedures" folder
+/// makes it findable for #include and INSERTINCLUDE.
+Function/S ZBR_GetUserProceduresFolder()
+
+	string path = FunctionPath("ZBR#ZBR_Ping")
+
+	if(!strlen(path))
+		return ""
+	endif
+
+	path = ParseFilePath(1, path, ":", 1, 0) + ZBR_USER_PROCEDURES_FOLDER + ":"
+
+	return ParseFilePath(5, path, "\\", 0, 0)
+End
+
+/// Queue the include of ZBR_ProcGlobal.ipf into the experiment. Compiling is up to the caller,
+/// see ZBR_SubmitReloadAndCompile().
+Function ZBR_SubmitInsertProcGlobal()
+
+	Execute/P/Q/Z "INSERTINCLUDE \"" + ZBR_PROCGLOBAL_FILE + "\""
+
+	return 0
+End
+
+/// Queue the removal of the include of ZBR_ProcGlobal.ipf from the experiment. Compiling is up to
+/// the caller, see ZBR_SubmitReloadAndCompile().
+Function ZBR_SubmitDeleteProcGlobal()
+
+	Execute/P/Q/Z "DELETEINCLUDE \"" + ZBR_PROCGLOBAL_FILE + "\""
+
+	return 0
+End
+
+/// Return the names of the running named background tasks, except the ones of this module
+///
+/// Recompiling stops procedure code which runs in background tasks, e.g. a data acquisition,
+/// so callers can refuse to recompile while these run.
+Function/S ZBR_GetRunningBackgroundTasks()
+
+	variable i, numTasks
+	string info, name
+	string list = ""
+
+	CtrlNamedBackground _all_, status
+	numTasks = ItemsInList(S_info, "\r")
+	for(i = 0; i < numTasks; i += 1)
+		info = StringFromList(i, S_info, "\r")
+		name = StringByKey("NAME", info)
+		if(!strlen(name) || StringMatch(name, "ZBR_*"))
+			continue
+		endif
+		if(NumberByKey("RUN", info) == 1)
+			list = AddListItem(name, list, ";", Inf)
+		endif
+	endfor
+
+	return list
 End
 
 /// Deferred: Run the command of the given token, see ZBR_QueueCommand()
@@ -467,11 +596,19 @@ Function ZBR_IsCompiled()
 	return strlen(FunctionInfo("ProcGlobal#ZBR_DefinitelyNotARealFunctionName_8f3a1c")) == 0
 End
 
-/// Reads root:gClaudeHelperCompileCounter (bumped by AfterCompiledHook on every
+/// True from ZBR_SubmitReloadAndCompile() until the recompile watchdog restarted the
+/// handler after the compile, successful or not. Until then ZBR_IsCompiled() may still
+/// report the state before the queued reload/compile ran.
+Function ZBR_IsRecompilePending()
+
+	return NumVarOrDefault(ZBR_PACKAGEFOLDER + ":recompilePending", 0)
+End
+
+/// Reads compileCounter of the package folder (bumped by AfterCompiledHook on every
 /// successful compile) without creating it. Returns -1 if not yet created.
 Function ZBR_ReadCompileCounter()
 
-	return NumVarOrDefault("root:gClaudeHelperCompileCounter", -1)
+	return NumVarOrDefault(ZBR_PACKAGEFOLDER + ":compileCounter", -1)
 End
 
 /// Queues ZBR_StopHandlerBeforeRecompile, RELOAD CHANGED PROCS, and COMPILEPROCEDURES as
@@ -480,6 +617,10 @@ End
 /// queued behind COMPILEPROCEDURES is discarded by the recompile. See SESSION_NOTES.md
 /// for the crash mitigation this exists for.
 Function ZBR_SubmitReloadAndCompile()
+
+	// set right away, before the queue runs, see ZBR_IsRecompilePending()
+	DFREF      dfr                  = ZBR_GetPackageFolder()
+	variable/G dfr:recompilePending = 1
 
 	// anything queued behind COMPILEPROCEDURES is discarded, so the V_flag cleanup is
 	// queued by ZBR_StartHandlerAfterRecompile()
@@ -498,6 +639,9 @@ Function ZBR_StopHandlerBeforeRecompile()
 
 	variable err
 
+	DFREF      dfr                  = ZBR_GetPackageFolder()
+	variable/G dfr:recompilePending = 1
+
 	zeromq_handler_stop(); err = GetRTError(1)
 	ZBR_ArmRecompileWatchdog()
 
@@ -511,6 +655,7 @@ Function ZBR_StartHandlerAfterRecompile()
 	variable err
 
 	zeromq_handler_start(); err = GetRTError(1)
+	KillVariables/Z $(ZBR_PACKAGEFOLDER + ":recompilePending")
 	Execute/P/Q/Z "AUTOCOMPILE ON "
 
 	// V_flag cleanup for the Execute/Z entries of ZBR_SubmitReloadAndCompile()
@@ -521,14 +666,15 @@ End
 
 /// Arms a named background task that unconditionally restarts the ZeroMQ handler after a
 /// reload/compile attempt, whether it succeeded or failed (AfterCompiledHook alone can't
-/// cover the failure case). `start=60` sets an explicit ~1s floor before the first
+/// cover the failure case). `start=(ticks + 60)` sets an explicit ~1s floor before the first
 /// possible tick, since background tasks and the deferred operation queue are not
 /// strictly ordered -- see SESSION_NOTES.md for the timing data behind this value.
 static Function ZBR_ArmRecompileWatchdog()
 
 	variable err
 
-	CtrlNamedBackground $ZBR_RECOMPILE_WATCHDOG_TASK, period=30, proc=ZBR_RecompileWatchdogTick, start=60
+	// start takes an absolute tick count
+	CtrlNamedBackground $ZBR_RECOMPILE_WATCHDOG_TASK, period=30, proc=ZBR_RecompileWatchdogTick, start=(ticks + 60)
 	err = GetRTError(1)
 
 	return 0
@@ -677,48 +823,28 @@ static Function/S ZBR_FirstNewListEntry(string afterList, string beforeList)
 	return ""
 End
 
-/// Resolves a bare help-file name (as returned by WinList's WIN:512 bit) to a full path,
-/// or "" if not found in Igor's standard Help Files folders.
-static Function/S ZBR_ResolveHelpFilePath(string bareName)
-
-	string specialDirs = "Igor Application;Igor Pro User Files"
-	string base, candidate
-	variable i, n
-
-	n = ItemsInList(specialDirs)
-	for(i = 0; i < n; i += 1)
-		base = SpecialDirPath(StringFromList(i, specialDirs), 0, 1, 0)
-		if(strlen(base) == 0)
-			continue
-		endif
-		candidate = base + "Igor Help Files:" + bareName
-		GetFileFolderInfo/Q/Z candidate
-		if(V_flag == 0)
-			return candidate
-		endif
-	endfor
-
-	return ""
-End
-
-/// Exports filePath (an .ihf help file) as HTML to tmpHtmlPath, restoring whatever help
-/// windows were open beforehand. Returns "OK|<restoreFailures>" or
-/// "ERROR|<message>|<restoreFailures>". See SESSION_NOTES.md for the full sequence and
-/// the Abort-dialog pitfall this avoids.
+/// Exports filePath (an .ihf help file) as HTML to tmpHtmlPath. Only the help window of the
+/// file is closed while reading and reopened afterward, all other help windows stay open.
+/// Returns "OK|<restoreFailures>" or "ERROR|<message>|<restoreFailures>". See
+/// SESSION_NOTES.md for the full sequence and the Abort-dialog pitfall this avoids.
 Function/S ZBR_ReadHelpFile(string filePath, string tmpHtmlPath)
 
-	string helpAll, helpVisible, notebooksBefore, newName, restoreFailures
-	string name, resolvedPath, statusStr
-	variable i, numHelpWin, visibleFlag, err
+	string notebooksBefore, newName, restoreFailures, fileName, statusStr
+	variable wasOpen, wasVisible, err
 
-	helpAll         = WinList("*", ";", "WIN:512")
-	helpVisible     = WinList("*", ";", "WIN:512,VISIBLE:1")
+	// help windows are named after their file
+	fileName        = ParseFilePath(0, filePath, "\\", 1, 0)
+	wasOpen         = WhichListItem(fileName, WinList("*", ";", "WIN:512")) != -1
+	wasVisible      = WhichListItem(fileName, WinList("*", ";", "WIN:512,VISIBLE:1")) != -1
 	notebooksBefore = WinList("*", ";", "WIN:16")
 	newName         = ""
 	statusStr       = "OK"
 
 	try
-		CloseHelp/ALL; AbortOnRTE
+		// a help file can not be opened as notebook while it is open as help window
+		if(wasOpen)
+			CloseHelp/NAME=fileName; AbortOnRTE
+		endif
 
 		OpenNotebook/R filePath; AbortOnRTE
 
@@ -739,20 +865,12 @@ Function/S ZBR_ReadHelpFile(string filePath, string tmpHtmlPath)
 	endif
 
 	restoreFailures = ""
-	numHelpWin      = ItemsInList(helpAll)
-	for(i = 0; i < numHelpWin; i += 1)
-		name         = StringFromList(i, helpAll)
-		resolvedPath = ZBR_ResolveHelpFilePath(name)
-		if(strlen(resolvedPath) == 0)
-			restoreFailures = AddListItem(name, restoreFailures, ";", Inf)
-			continue
+	if(wasOpen)
+		OpenHelp/V=(wasVisible)/INT=0/Z=1 filePath; err = GetRTError(1)
+		if(err || WhichListItem(fileName, WinList("*", ";", "WIN:512")) == -1)
+			restoreFailures = fileName
 		endif
-		visibleFlag = (WhichListItem(name, helpVisible) != -1) ? 1 : 0
-		OpenHelp/V=(visibleFlag)/INT=0/Z=1 resolvedPath; err = GetRTError(1)
-		if(err)
-			restoreFailures = AddListItem(name, restoreFailures, ";", Inf)
-		endif
-	endfor
+	endif
 
 	return statusStr + "|" + restoreFailures
 End
@@ -762,25 +880,104 @@ End
 /// (Re-)binds this module's ZeroMQ ROUTER socket and starts its handler. Does not call
 /// zeromq_stop() first, so it won't tear down any other ZeroMQ binds in the same
 /// experiment (e.g. MIES's own). Safe to call repeatedly -- an already-bound error is
-/// caught, not propagated. Called from IgorStartOrNewHook; recompiles instead just
+/// caught, not propagated. Also starts the background task ZBR_BindKeeper, which rebinds
+/// the socket on request of the bridge, see ZBR_BindKeeperTick(). Called from
+/// IgorStartOrNewHook; recompiles instead just
 /// stop/restart the handler via ZBR_StopHandlerBeforeRecompile/
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
 Function ZBR_EnsureZeroMQBound()
 
-	variable err, port
-	string bindURL, envPort
+	variable err
+
+	ZBR_BindSocket()
+
+	CtrlNamedBackground $ZBR_BIND_KEEPER_TASK, period=ZBR_BIND_KEEPER_PERIOD, proc=ZBR_BindKeeperTick, start
+	err = GetRTError(1)
+
+	return 0
+End
+
+/// Background task: Rebind the socket and restart the handler when the bridge requests it,
+/// e.g. after zeromq_stop() of other code, which tears down all ZeroMQ sockets of the
+/// process. Skipped while a reload/compile of the bridge runs, which stops the handler on
+/// purpose.
+///
+/// The ZeroMQ-XOP can not tell silently whether a socket is bound: a bind attempt prints
+/// "Address in use" into the history, and zeromq_handler_start() reports a running
+/// handler also when other code, e.g. MIES, restarted it with only its own binds. So the
+/// bridge, which gets no reply then, writes a request file (see
+/// ZBR_GetRebindRequestFile()) and this task only checks for it.
+Function ZBR_BindKeeperTick(STRUCT WMBackgroundStruct &s)
+
+	string requestFile
+
+	if(NumVarOrDefault(ZBR_PACKAGEFOLDER + ":recompilePending", 0))
+		return 0
+	endif
+
+	requestFile = ZBR_GetRebindRequestFile()
+	if(!strlen(requestFile))
+		return 0
+	endif
+
+	GetFileFolderInfo/Q/Z requestFile
+	if(V_flag || !V_isFile)
+		return 0
+	endif
+
+	DeleteFile/Z requestFile
+	ZBR_BindSocket()
+
+	return 0
+End
+
+/// Path of the file by which the bridge requests a rebind of the socket on our port:
+/// %LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>, "" without LOCALAPPDATA
+static Function/S ZBR_GetRebindRequestFile()
+
+	string localAppData
+
+	localAppData = GetEnvironmentVariable("LOCALAPPDATA")
+	if(!strlen(localAppData))
+		return ""
+	endif
+
+	return ParseFilePath(5, localAppData, ":", 0, 0) + ":" + ZBR_REBIND_REQUEST_FOLDER + ":" + ZBR_REBIND_REQUEST_FILE + num2istr(ZBR_GetPort())
+End
+
+/// Port of our ZeroMQ socket: IGOR_PRO_BRIDGE_PORT or the default port
+///
+/// @param verbose [optional, defaults to false] print a message if IGOR_PRO_BRIDGE_PORT
+///                can not be parsed
+static Function ZBR_GetPort([variable verbose])
+
+	variable port, err
+	string envPort
 
 	envPort = GetEnvironmentVariable(ZBR_ZEROMQ_ENV_PORT)
 	if(!strlen(envPort))
-		port = ZBR_ZEROMQ_DEFAULT_PORT
-	else
-		port = str2num(envPort); err = GetRTError(1)
-		if(numType(port) == 2)
-			printf "Could not parse port number from %s: %s\rUsing default port %d\r", ZBR_ZEROMQ_ENV_PORT, envPort, ZBR_ZEROMQ_DEFAULT_PORT
-			port = ZBR_ZEROMQ_DEFAULT_PORT
-		endif
+		return ZBR_ZEROMQ_DEFAULT_PORT
 	endif
 
+	port = str2num(envPort); err = GetRTError(1)
+	if(numType(port) == 2)
+		if(!ParamIsDefault(verbose) && verbose)
+			printf "Could not parse port number from %s: %s\rUsing default port %d\r", ZBR_ZEROMQ_ENV_PORT, envPort, ZBR_ZEROMQ_DEFAULT_PORT
+		endif
+		return ZBR_ZEROMQ_DEFAULT_PORT
+	endif
+
+	return port
+End
+
+/// Bind the ZeroMQ ROUTER socket of this module and start the handler, see
+/// ZBR_EnsureZeroMQBound()
+static Function ZBR_BindSocket()
+
+	variable err, port
+	string bindURL
+
+	port = ZBR_GetPort(verbose = 1)
 	sprintf bindURL, "%s:%d", ZBR_ZEROMQ_ENDPOINT, port
 	zeromq_server_bind(bindURL); err = GetRTError(1)
 	if(!err)
@@ -828,10 +1025,11 @@ static Function AfterCompiledHook()
 	ExperimentModified
 	modifiedBefore = V_flag
 
-	variable/G root:gClaudeHelperCompileCounter
-	NVAR gClaudeHelperCompileCounter = root:gClaudeHelperCompileCounter
+	DFREF dfr = ZBR_GetPackageFolder()
+	variable/G dfr:compileCounter
+	NVAR compileCounter = dfr:compileCounter
 
-	gClaudeHelperCompileCounter += 1
+	compileCounter += 1
 
 	if(!modifiedBefore)
 		ExperimentModified 0
