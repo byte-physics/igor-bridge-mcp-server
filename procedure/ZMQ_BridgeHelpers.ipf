@@ -654,14 +654,15 @@ End
 
 /// Arms a named background task that unconditionally restarts the ZeroMQ handler after a
 /// reload/compile attempt, whether it succeeded or failed (AfterCompiledHook alone can't
-/// cover the failure case). `start=60` sets an explicit ~1s floor before the first
+/// cover the failure case). `start=(ticks + 60)` sets an explicit ~1s floor before the first
 /// possible tick, since background tasks and the deferred operation queue are not
 /// strictly ordered -- see SESSION_NOTES.md for the timing data behind this value.
 static Function ZBR_ArmRecompileWatchdog()
 
 	variable err
 
-	CtrlNamedBackground $ZBR_RECOMPILE_WATCHDOG_TASK, period=30, proc=ZBR_RecompileWatchdogTick, start=60
+	// start takes an absolute tick count
+	CtrlNamedBackground $ZBR_RECOMPILE_WATCHDOG_TASK, period=30, proc=ZBR_RecompileWatchdogTick, start=(ticks + 60)
 	err = GetRTError(1)
 
 	return 0

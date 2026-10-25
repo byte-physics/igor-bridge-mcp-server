@@ -725,7 +725,7 @@ def reload_and_compile_procedures() -> dict:
     ZBR_RecompileWatchdogTick in ZMQ_BridgeHelpers.ipf: a named background task, armed
     right before the handler is stopped, that unconditionally rebinds/restarts the
     handler regardless of whether the compile succeeds or fails. It is registered with
-    `start=60` (an explicit ~1-second floor before its first possible tick, independent
+    `start=(ticks + 60)` (an explicit ~1-second floor before its first possible tick, independent
     of its `period=30` interval) so it cannot fire before RELOAD CHANGED
     PROCS/COMPILEPROCEDURES have finished draining Igor's operation queue -- confirmed
     necessary by live timing instrumentation (stopmstimer(-2)) showing the background
