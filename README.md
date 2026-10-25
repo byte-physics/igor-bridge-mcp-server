@@ -40,7 +40,8 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
 - **Environment inspection** — `get_environment_summary` summarizes the live
   instance (version, loaded experiment, XOPs, included procedure files, data
   folders, Debugger settings). `read_help_file` reads an Igor help file
-  (`.ihf`) as structured text. `get_bridge_version` reports the running
+  (`.ihf`) as structured text, optionally with character styles, and caches it;
+  `edit_help_file` edits a help file with Notebook operations and verifies its topics. `get_bridge_version` reports the running
   bridge/Python/package versions.
 - **Launching and switching instances** — `configure_igor_launch` records the
   Igor Pro executable path to use, and optionally a custom ZeroMQ port (for

@@ -277,10 +277,13 @@ Reads an Igor Pro help file (`.ihf`) as structured, formatted text. `CloseHelp`/
 operations, not subject to the Execute-only-from-top-level restriction, so the whole
 sequence runs as one direct, synchronous round trip:
 
-1. Snapshot every currently open help file (visible or hidden) and every open
-   plain-notebook window.
-2. `CloseHelp/ALL` (required: an `.ihf` can't be opened as a notebook while Igor
-   considers it already open as a help file).
+1. Note whether the file's own help window is open (visible or hidden), and snapshot
+   every open plain-notebook window.
+2. `CloseHelp/NAME=<file name>` for that window only (required: an `.ihf` can't be
+   opened as a notebook while Igor considers it already open as a help file). Up to
+   v2.3.2 this was `CloseHelp/ALL`, and help files outside the standard Help Files
+   folders (e.g. linked by shortcuts or XOP help files) could not be reopened in step 6
+   -- Igor does not tell the path of a help window.
 3. `OpenNotebook/R filePath`, then diff the notebook window list against the step-1
    snapshot to find the name Igor assigned the new window (`OpenNotebook/R` doesn't
    return this directly).
@@ -288,7 +291,7 @@ sequence runs as one direct, synchronous round trip:
    Python side afterward (both processes run on the same machine, so this sidesteps any
    question about reply-size limits for a potentially large export).
 5. `KillWindow/Z` the temporary notebook.
-6. Restore every help file captured in step 1.
+6. Reopen the help window of step 1, if it was open, from `filePath`.
 
 Steps 5-6 always run (via `try`/`catch`, since Igor procedure code has no `finally`)
 even if an earlier step failed, so a failure partway through still restores whatever

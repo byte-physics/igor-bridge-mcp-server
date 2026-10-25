@@ -802,48 +802,28 @@ static Function/S ZBR_FirstNewListEntry(string afterList, string beforeList)
 	return ""
 End
 
-/// Resolves a bare help-file name (as returned by WinList's WIN:512 bit) to a full path,
-/// or "" if not found in Igor's standard Help Files folders.
-static Function/S ZBR_ResolveHelpFilePath(string bareName)
-
-	string specialDirs = "Igor Application;Igor Pro User Files"
-	string base, candidate
-	variable i, n
-
-	n = ItemsInList(specialDirs)
-	for(i = 0; i < n; i += 1)
-		base = SpecialDirPath(StringFromList(i, specialDirs), 0, 1, 0)
-		if(strlen(base) == 0)
-			continue
-		endif
-		candidate = base + "Igor Help Files:" + bareName
-		GetFileFolderInfo/Q/Z candidate
-		if(V_flag == 0)
-			return candidate
-		endif
-	endfor
-
-	return ""
-End
-
-/// Exports filePath (an .ihf help file) as HTML to tmpHtmlPath, restoring whatever help
-/// windows were open beforehand. Returns "OK|<restoreFailures>" or
-/// "ERROR|<message>|<restoreFailures>". See SESSION_NOTES.md for the full sequence and
-/// the Abort-dialog pitfall this avoids.
+/// Exports filePath (an .ihf help file) as HTML to tmpHtmlPath. Only the help window of the
+/// file is closed while reading and reopened afterward, all other help windows stay open.
+/// Returns "OK|<restoreFailures>" or "ERROR|<message>|<restoreFailures>". See
+/// SESSION_NOTES.md for the full sequence and the Abort-dialog pitfall this avoids.
 Function/S ZBR_ReadHelpFile(string filePath, string tmpHtmlPath)
 
-	string helpAll, helpVisible, notebooksBefore, newName, restoreFailures
-	string name, resolvedPath, statusStr
-	variable i, numHelpWin, visibleFlag, err
+	string notebooksBefore, newName, restoreFailures, fileName, statusStr
+	variable wasOpen, wasVisible, err
 
-	helpAll         = WinList("*", ";", "WIN:512")
-	helpVisible     = WinList("*", ";", "WIN:512,VISIBLE:1")
+	// help windows are named after their file
+	fileName        = ParseFilePath(0, filePath, "\\", 1, 0)
+	wasOpen         = WhichListItem(fileName, WinList("*", ";", "WIN:512")) != -1
+	wasVisible      = WhichListItem(fileName, WinList("*", ";", "WIN:512,VISIBLE:1")) != -1
 	notebooksBefore = WinList("*", ";", "WIN:16")
 	newName         = ""
 	statusStr       = "OK"
 
 	try
-		CloseHelp/ALL; AbortOnRTE
+		// a help file can not be opened as notebook while it is open as help window
+		if(wasOpen)
+			CloseHelp/NAME=fileName; AbortOnRTE
+		endif
 
 		OpenNotebook/R filePath; AbortOnRTE
 
@@ -864,20 +844,12 @@ Function/S ZBR_ReadHelpFile(string filePath, string tmpHtmlPath)
 	endif
 
 	restoreFailures = ""
-	numHelpWin      = ItemsInList(helpAll)
-	for(i = 0; i < numHelpWin; i += 1)
-		name         = StringFromList(i, helpAll)
-		resolvedPath = ZBR_ResolveHelpFilePath(name)
-		if(strlen(resolvedPath) == 0)
-			restoreFailures = AddListItem(name, restoreFailures, ";", Inf)
-			continue
+	if(wasOpen)
+		OpenHelp/V=(wasVisible)/INT=0/Z=1 filePath; err = GetRTError(1)
+		if(err || WhichListItem(fileName, WinList("*", ";", "WIN:512")) == -1)
+			restoreFailures = fileName
 		endif
-		visibleFlag = (WhichListItem(name, helpVisible) != -1) ? 1 : 0
-		OpenHelp/V=(visibleFlag)/INT=0/Z=1 resolvedPath; err = GetRTError(1)
-		if(err)
-			restoreFailures = AddListItem(name, restoreFailures, ";", Inf)
-		endif
-	endfor
+	endif
 
 	return statusStr + "|" + restoreFailures
 End

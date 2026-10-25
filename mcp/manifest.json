@@ -114,6 +114,10 @@
       "description": "Read an Igor Pro help file (.ihf) as structured, formatted text (paragraph style names preserved, e.g. Topic/Code1/Steps), without leaving any lasting change to Igor's help-window state."
     },
     {
+      "name": "edit_help_file",
+      "description": "Edit an Igor help file with Notebook operations and verify its topics with DisplayHelpTopic"
+    },
+    {
       "name": "get_bridge_version",
       "description": "Return the version of this Igor Pro Bridge build that is actually running right now, plus the Python interpreter/package versions it's running with."
     },

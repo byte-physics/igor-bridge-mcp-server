@@ -165,6 +165,7 @@ This is a *local* MCP server (stdio transport) -- it only works from a Claude De
 session running on the same Windows machine as Igor Pro, not from a cloud/Cowork sandbox.
 """
 
+import hashlib
 import html.parser
 import importlib.metadata
 import json
@@ -1340,78 +1341,154 @@ def get_environment_summary() -> dict:
 # this sidesteps any question about reply-size limits for a potentially large export.
 
 
-class _NotebookHTMLParser(html.parser.HTMLParser):
-    """Extracts one {"style": ..., "text": ...} record per <P> paragraph from a
-    notebook's HTML export (SaveNotebook/S=5)."""
+_CSS_RULE_REGEXP = re.compile(r"P\.([\w+\-]+)\s*\{([^}]*)\}", re.IGNORECASE)
 
-    def __init__(self):
+
+def _css_flags(css: str, base: dict) -> dict:
+    """Apply the bold/italic/underline declarations of `css` on top of `base`."""
+    flags = dict(base)
+    for declaration in css.split(";"):
+        key, _, value = declaration.partition(":")
+        key, value = key.strip().lower(), value.strip().lower()
+        if key == "font-weight":
+            flags["bold"] = value in ("bold", "bolder") or value.isdigit() and int(value) >= 600
+        elif key == "font-style":
+            flags["italic"] = value in ("italic", "oblique")
+        elif key == "text-decoration":
+            flags["underline"] = "underline" in value
+    return flags
+
+
+class _NotebookHTMLParser(html.parser.HTMLParser):
+    """Extracts one {"style": ..., "text": ...} record per <P> paragraph from a notebook's
+    HTML export (SaveNotebook/S=5). With `char_styles`, each record also gets "runs": the
+    text split into runs with their effective "bold"/"italic"/"underline" flags, combined
+    from the paragraph's CSS class (the ruler) and the SPAN styles inside it."""
+
+    _PLAIN = {"bold": False, "italic": False, "underline": False}
+
+    def __init__(self, char_styles: bool = False):
         super().__init__(convert_charrefs=True)
         self.paragraphs = []
+        self._char_styles = char_styles
+        self._in_style_block = False
+        self._css = []
+        self._class_flags = {}
         self._in_paragraph = False
         self._style = ""
         self._text_parts = []
+        self._runs = []
+        self._flag_stack = []
 
     def handle_starttag(self, tag, attrs):
-        if tag.lower() == "p":
+        tag = tag.lower()
+        attrs = {key.lower(): value for key, value in attrs}
+        if tag == "style":
+            self._in_style_block = True
+        elif tag == "p":
             self._in_paragraph = True
-            self._style = ""
+            self._style = attrs.get("class") or ""
             self._text_parts = []
-            for key, value in attrs:
-                if key.lower() == "class" and value:
-                    self._style = value
+            self._runs = []
+            self._flag_stack = [self._class_flags.get(self._style, self._PLAIN)]
+        elif tag == "span" and self._in_paragraph:
+            self._flag_stack.append(_css_flags(attrs.get("style") or "", self._flag_stack[-1]))
 
     def handle_endtag(self, tag):
-        if tag.lower() == "p" and self._in_paragraph:
-            text = "".join(self._text_parts).strip()
-            self.paragraphs.append({"style": self._style, "text": text})
+        tag = tag.lower()
+        if tag == "style" and self._in_style_block:
+            self._in_style_block = False
+            for name, body in _CSS_RULE_REGEXP.findall("".join(self._css)):
+                self._class_flags[name] = _css_flags(body, self._PLAIN)
+        elif tag == "span" and self._in_paragraph and len(self._flag_stack) > 1:
+            self._flag_stack.pop()
+        elif tag == "p" and self._in_paragraph:
+            record = {"style": self._style, "text": "".join(self._text_parts).strip()}
+            if self._char_styles:
+                record["runs"] = self._runs
+            self.paragraphs.append(record)
             self._in_paragraph = False
 
     def handle_data(self, data):
-        if self._in_paragraph:
+        if self._in_style_block:
+            self._css.append(data)
+        elif self._in_paragraph:
             self._text_parts.append(data)
+            flags = self._flag_stack[-1]
+            if self._runs and all(self._runs[-1][k] == v for k, v in flags.items()):
+                self._runs[-1]["text"] += data
+            else:
+                self._runs.append({"text": data, **flags})
+
+
+_HELP_CACHE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "igor-pro-bridge", "help-cache"
+)
+
+
+def _help_cache_path(file_path: str, char_styles: bool):
+    """Cache file for a help file, keyed by the file's size and modification time, this
+    bridge's version and Igor Pro's version and build. None if Igor Pro does not answer."""
+    try:
+        igor_info = call_function("ZBR#ZBR_IgorInfo", [0])
+    except (IgorZmqError, IgorZmqUnreachable):
+        return None
+    igor_version = ";".join(
+        part for part in (igor_info or "").split(";") if part.split(":")[0] in ("IGORVERS", "BUILD")
+    )
+    stat = os.stat(file_path)
+    key = json.dumps(
+        [file_path.lower(), stat.st_size, stat.st_mtime_ns, _BRIDGE_VERSION, igor_version, char_styles]
+    )
+    return os.path.join(_HELP_CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".json")
 
 
 @mcp.tool()
-def read_help_file(file_path: str, timeout_ms: int = 30000) -> dict:
-    """Read an Igor Pro help file (.ihf) as structured, formatted text -- e.g. to
-    look up an operation's exact flags/behavior straight from Igor's own docs --
-    without leaving any lasting change to Igor's help-window state.
+def read_help_file(file_path: str, char_styles: bool = False, timeout_ms: int = 30000) -> dict:
+    """Read an Igor Pro help file (.ihf) as structured, formatted text -- e.g. to look up an
+    operation's exact flags/behavior straight from Igor's own docs -- without leaving any
+    lasting change to Igor's help-window state.
 
     file_path must be a full path to an existing .ihf file (e.g. one found via
-    get_environment_summary's "loaded_xops" field plus the global/user Help Files
-    folders under Igor's own installation for XOP-supplied help files).
+    get_environment_summary's "loaded_xops" field plus the global/user Help Files folders
+    under Igor's own installation for XOP-supplied help files).
 
-    timeout_ms defaults to 30 seconds rather than this bridge's usual 5-second
-    default -- confirmed live that exporting a genuinely large help file (e.g. the
-    entire "Igor Reference.ihf" manual) as HTML can take longer than 5 seconds, which
-    would otherwise time out this call even though Igor-side the export eventually
-    succeeds anyway (harmlessly logging a "Host unreachable" ZeroMQ-XOP error to
-    history when it tries to reply to a client that already gave up -- see
-    check_bridge_health if you see that in read_session_history's output after a
-    timeout here). Pass a larger value still for very large help files if 30s isn't
-    enough.
+    Results are cached per machine, keyed by the file's size and modification time, this
+    bridge's version and Igor Pro's version, so reading the same file again does not need
+    Igor Pro to export it again.
 
     Returns a dict with:
-      - "paragraphs": [{"style": "Topic", "text": "Debugging"}, ...] -- "style" is
-        WaveMetrics' own paragraph-class convention (e.g. "Topic" for a heading,
-        "Code1" for example code, "Steps" for a bullet item), "" if unset.
-      - "restore_failures": bare file names that could not be resolved back to a full
-        path and so were NOT reopened as help windows (e.g. a help file supplied from
-        somewhere other than the two standard Help Files folders).
+      - "paragraphs": [{"style": "Topic", "text": "Debugging"}, ...] -- "style" is the
+        ruler name, i.e. WaveMetrics' own paragraph-class convention (e.g. "Topic" for a
+        heading, "Subtopic" for a function entry, "Code1" for example code), "" if unset.
+        With `char_styles`, each paragraph also has "runs": its text split into runs with
+        their effective "bold"/"italic"/"underline" flags, e.g. to check the bold and
+        underlined name of a subtopic, see edit_help_file.
+      - "restore_failures": the file's own help window, if it was open before and could
+        not be reopened. Only that window is closed while reading, all other help windows
+        stay open.
+
+    timeout_ms defaults to 30 seconds: exporting a large help file (e.g. "Igor
+    Reference.ihf") can take longer than the usual 5 seconds.
 
     Raises if file_path does not exist, or if the underlying OpenNotebook/SaveNotebook
-    sequence fails Igor-side (e.g. file_path is not actually a notebook-compatible
-    file) -- help-window restoration is still attempted even then.
+    sequence fails Igor-side -- help-window restoration is still attempted even then.
     """
     normalized = os.path.abspath(file_path)
     if not os.path.isfile(normalized):
         raise RuntimeError(f"'{normalized}' does not exist or is not a file.")
 
+    cache_path = _help_cache_path(normalized, char_styles)
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            pass
+
     tmp_fd, tmp_html_path = tempfile.mkstemp(suffix=".html", prefix="igor_help_")
     os.close(tmp_fd)
-    os.remove(
-        tmp_html_path
-    )  # SaveNotebook must create it fresh; only the name is reused
+    os.remove(tmp_html_path)  # SaveNotebook must create it fresh; only the name is reused
 
     try:
         status = call_function(
@@ -1430,13 +1507,12 @@ def read_help_file(file_path: str, timeout_ms: int = 30000) -> dict:
 
         if not os.path.isfile(tmp_html_path):
             raise RuntimeError(
-                f"ZBR_ReadHelpFile reported success but {tmp_html_path!r} was not "
-                "created."
+                f"ZBR_ReadHelpFile reported success but {tmp_html_path!r} was not created."
             )
 
         with open(tmp_html_path, "r", encoding="utf-8") as f:
             html_text = f.read()
-        parser = _NotebookHTMLParser()
+        parser = _NotebookHTMLParser(char_styles=char_styles)
         parser.feed(html_text)
     finally:
         try:
@@ -1445,7 +1521,109 @@ def read_help_file(file_path: str, timeout_ms: int = 30000) -> dict:
         except Exception:
             pass
 
-    return {"paragraphs": parser.paragraphs, "restore_failures": restore_failures}
+    result = {"paragraphs": parser.paragraphs, "restore_failures": restore_failures}
+    if cache_path:
+        try:
+            os.makedirs(_HELP_CACHE_DIR, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({"paragraphs": parser.paragraphs, "restore_failures": []}, f)
+        except OSError:
+            pass
+    return result
+
+
+def _igor_string_literal(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+@mcp.tool()
+def edit_help_file(
+    file_path: str,
+    notebook_code: str,
+    verify_topics: Optional[list] = None,
+    force: bool = False,
+) -> dict:
+    """Edit an Igor Pro help file (.ihf) with Notebook operations, and verify its topics.
+
+    Igor Pro help files are formatted notebooks: closed as help window, opened as notebook,
+    edited, saved and reopened as help file, which compiles it. This tool does exactly
+    that, with `notebook_code` as the editing step. `notebook_code` is Igor function code
+    which refers to the opened notebook by the local string `nb`, e.g.
+
+        Notebook $nb, selection={endOfFile, endOfFile}
+        Notebook $nb, ruler=Subtopic, text="MyFunc(arg)\\r"
+
+    Afterward, each name of `verify_topics` is checked with `DisplayHelpTopic/Z`. If the code
+    fails, the file is not saved. The code runs via run_igor_code (see there for `force`).
+
+    **Formatting rules of help files** (Igor manual, "Syntax of a Help File"; copy the
+    formatting of existing entries of the same file, check it with read_help_file and
+    `char_styles`):
+      - Topic: ruler `Topic`, the paragraph starts with a plain bullet and tab.
+      - Subtopic: a ruler whose name starts with `Subtopic`. The subtopic name is the
+        **bold and underlined** text, usually the ruler's default style. Text inserted via
+        `Notebook text=` gets the plain style of the insertion point, so select the name
+        afterward and set `fStyle=-1` (the ruler's style), and `fStyle=0` for the argument
+        list -- otherwise DisplayHelpTopic does not find the subtopic (error 5018).
+      - Function entries in WaveMetrics' style: `Subtopic` for the signature,
+        `FunctionBody1` for the description with an empty `FunctionBody1` paragraph between
+        entries, `OperationSection` for headings like "Parameters" (`fStyle=-1`),
+        `OperationKeywords1a` for parameters ("name<tab>text"), parameter names italic
+        (`fStyle=2`).
+      - Select text with `Notebook $nb, findText={"text", 2 + 4}` (case-sensitive, whole
+        words, searching from the end of the current selection; V_flag is 1 if found).
+      - A file may end without a final paragraph break: the first "\\r" appended at the
+        end then only terminates the last paragraph.
+      - A help window of the same name from another folder can hide the edited file in
+        DisplayHelpTopic; close it first.
+
+    Returns run_igor_code's result plus "saved" and "topics": {name: True if found}.
+    """
+    normalized = os.path.abspath(file_path)
+    if not os.path.isfile(normalized):
+        raise RuntimeError(f"'{normalized}' does not exist or is not a file.")
+
+    topics = list(verify_topics or [])
+    verify_lines = "".join(
+        f"\tDisplayHelpTopic/Z {_igor_string_literal(topic)}\n"
+        f"\tprintf \"ZBR_TOPIC:%d:%s\\r\", V_flag, {_igor_string_literal(topic)}\n"
+        for topic in topics
+    )
+    code = (
+        '\tstring nb = "ZBR_HelpEdit"\n'
+        f"\tstring path = {_igor_string_literal(normalized)}\n"
+        "\tvariable err\n"
+        "\n"
+        "\tCloseHelp/FILE=path; err = GetRTError(1)\n"
+        "\tOpenNotebook/N=$nb/V=0 path\n"
+        "\ttry\n"
+        f"{notebook_code}\n"
+        "\t\tAbortOnRTE\n"
+        "\t\tSaveNotebook $nb; AbortOnRTE\n"
+        "\tcatch\n"
+        "\t\terr = GetRTError(1)\n"
+        '\t\tprint "ZBR_EDIT_ERROR:" + GetErrMessage(err)\n'
+        "\t\tKillWindow/Z $nb\n"
+        "\t\tOpenHelp/V=0/INT=0/Z=1 path\n"
+        "\t\treturn 0\n"
+        "\tendtry\n"
+        "\tKillWindow/Z $nb\n"
+        "\tOpenHelp/V=0/INT=0/Z=1 path\n"
+        '\tprintf "ZBR_OPENHELP:%d\\r", V_flag\n'
+        f"{verify_lines}"
+    )
+
+    result = run_igor_code(code=code, force=force)
+    output = (result.get("output") or "").replace("\r", "\n")
+    result["saved"] = result.get("compiled", False) and "ZBR_EDIT_ERROR:" not in output
+    result["topics"] = {}
+    for line in output.split("\n"):
+        if line.startswith("ZBR_TOPIC:"):
+            _, flag, name = line.split(":", 2)
+            result["topics"][name] = flag.strip() == "0"
+        elif line.startswith("ZBR_EDIT_ERROR:"):
+            result["error"] = line[len("ZBR_EDIT_ERROR:") :]
+    return result
 
 
 # --- Bridge identity / health --------------------------------------------------------
