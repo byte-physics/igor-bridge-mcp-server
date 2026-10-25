@@ -386,9 +386,7 @@ def call_function(name, params=None, timeout_ms=_ZMQ_DEFAULT_RECV_TIMEOUT_MS):
     except zmq.error.Again:
         raise IgorZmqUnreachable(
             f"No reply from Igor Pro within {timeout_ms}ms while calling {name!r}. "
-            f"Make sure Igor Pro is running, ZMQ_BridgeHelpers.ipf is #include-d and "
-            f"compiled in the current experiment, and its ZeroMQ server socket is "
-            f"bound to {endpoint!r} (see check_bridge_health)."
+            f"{_diagnose_no_reply()}"
         ) from None
     finally:
         sock.close()
@@ -415,6 +413,29 @@ def call_function(name, params=None, timeout_ms=_ZMQ_DEFAULT_RECV_TIMEOUT_MS):
     if isinstance(result, list):
         return [_decode_typed(item) for item in result]
     return _decode_typed(result)
+
+
+def _diagnose_no_reply() -> str:
+    """Short diagnosis why Igor Pro does not answer, from the OS process and window list."""
+    try:
+        pids = _list_igor_pids()
+        if not pids:
+            return "Igor Pro is not running."
+        dialogs = _possible_dialogs()
+    except Exception:
+        return "See check_bridge_health."
+    if dialogs:
+        titles = ", ".join(repr(d["title"]) for d in dialogs)
+        return (
+            f"Igor Pro is running and shows these windows besides its main window: {titles}. "
+            "A modal dialog blocks the bridge -- see list_igor_windows/close_igor_window."
+        )
+    return (
+        "Igor Pro is running and shows no dialog, so it is probably busy (e.g. a long "
+        "command, saving a large experiment); try again later or with a longer timeout. "
+        "Otherwise ZMQ_BridgeHelpers.ipf may not be loaded or its socket not bound to "
+        f"{_igor_zmq_endpoint()}, see check_bridge_health."
+    )
 
 
 def _reachable(timeout_ms=1000):
@@ -1499,12 +1520,8 @@ def check_bridge_health() -> dict:
                 "close_igor_window (or ask the user to), then check again."
             )
         else:
-            problem = (
-                f"Igor Pro is running, but no reply from its ZeroMQ server ({e}). It may "
-                "be busy (e.g. saving a large experiment, a long command), or "
-                "ZMQ_BridgeHelpers.ipf isn't loaded/compiled, or its ZeroMQ socket isn't "
-                f"bound to {_igor_zmq_endpoint()}."
-            )
+            # the message of IgorZmqUnreachable holds the diagnosis, see _diagnose_no_reply
+            problem = str(e)
         return {
             "status": "FAIL",
             "problem": problem,
@@ -1803,6 +1820,50 @@ _IGOR_PRO_BRIDGE_PORT_ENV_VAR = "IGOR_PRO_BRIDGE_PORT"
 
 _configured_igor_exe_path = None
 
+_CONFIG_FILE = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "igor-pro-bridge", "config.json"
+)
+
+
+def _save_launch_config():
+    os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
+    with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"exe_path": _configured_igor_exe_path, "port": _configured_igor_port}, f)
+
+
+def _load_launch_config():
+    """Restore the settings of configure_igor_launch from a previous bridge process."""
+    global _configured_igor_exe_path, _configured_igor_port
+    try:
+        with open(_CONFIG_FILE, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return
+    exe_path = config.get("exe_path")
+    if exe_path and os.path.isfile(exe_path):
+        _configured_igor_exe_path = exe_path
+    port = config.get("port")
+    if isinstance(port, int) and 1 <= port <= 65535:
+        _configured_igor_port = port
+        os.environ[_IGOR_PRO_BRIDGE_PORT_ENV_VAR] = str(port)
+
+
+def _resolve_igor_exe_path():
+    """The configured executable, or else the one of a running Igor Pro process."""
+    global _configured_igor_exe_path
+    if _configured_igor_exe_path:
+        return _configured_igor_exe_path
+    for pid in _list_igor_pids():
+        path = _get_process_exe_path(pid)
+        if path and os.path.isfile(path):
+            _configured_igor_exe_path = path
+            _save_launch_config()
+            return path
+    return None
+
+
+_load_launch_config()
+
 
 def _build_igor_launch_env():
     """Return an environment dict for subprocess.Popen when launching Igor Pro,
@@ -1834,13 +1895,13 @@ def _build_igor_launch_env():
 def configure_igor_launch(exe_path: str, port: Optional[int] = None) -> dict:
     """Record the full path to the Igor Pro executable (e.g. "...\\IgorBinaries_x64\\
     Igor64.exe") to use for launch_igor_pro_unattended/load_experiment, for the rest
-    of this bridge process's session.
+    and save it, together with `port`, in %APPDATA%\\igor-pro-bridge\\config.json, so it
+    survives restarts of this bridge.
 
-    **Whatever agent is calling this tool should ask the user for this path once, at
-    the start of a session that might need to launch Igor Pro** -- do not guess or
-    default to a typical installation path; this repo alone has been tested against
-    Igor Pro installed in more than one differently-named folder. This setting is
-    session-scoped: it resets if this bridge process itself restarts.
+    Without a configured path, launch_igor_pro_unattended/load_experiment use the
+    executable of a running Igor Pro process. If neither exists, ask the user for the path
+    -- do not guess a typical installation path, the folder names differ between
+    installations.
 
     port, if given, is a custom ZeroMQ port for the NEXT launched instance to bind
     to, instead of its own default (5680) -- preparation for eventually talking to
@@ -1900,6 +1961,7 @@ def configure_igor_launch(exe_path: str, port: Optional[int] = None) -> dict:
 
     _configured_igor_exe_path = normalized
     _configured_igor_port = port
+    _save_launch_config()
     return {"configured_exe_path": normalized, "configured_port": port, "note": note}
 
 
@@ -1941,7 +2003,7 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
     wait_for_ready_seconds. Returns whether it became ready and how many polling
     attempts that took.
     """
-    if not _configured_igor_exe_path:
+    if not _resolve_igor_exe_path():
         raise RuntimeError(
             "No Igor Pro executable path configured yet. Ask the user for the full "
             "path to their Igor Pro executable (e.g. "
@@ -2045,15 +2107,21 @@ def load_experiment(
     least still a "hot" instance to save from afterward if you forgot; now there
     isn't).
 
-    Requires configure_igor_launch(exe_path) to have been called first.
+    Uses the executable of configure_igor_launch, or else the one of the running Igor
+    Pro process.
+
+    **Quit hooks of the open experiment still run** (`Quit/N` only skips Igor's own "save
+    changes?" question), and a hook may save the experiment itself, e.g. one which silently
+    saves an unmodified experiment on quit. Keep that in mind for experiment files under
+    version control.
 
     Raises if file_path does not point to an existing file, or if the old Igor Pro
     process does not fully exit within process_exit_timeout_seconds.
     """
-    if not _configured_igor_exe_path:
+    if not _resolve_igor_exe_path():
         raise RuntimeError(
-            "No Igor Pro executable path configured yet -- call "
-            "configure_igor_launch(exe_path) first."
+            "No Igor Pro executable path configured yet and no Igor Pro process is "
+            "running -- call configure_igor_launch(exe_path) first."
         )
 
     normalized = os.path.abspath(file_path)
@@ -2110,9 +2178,11 @@ def load_experiment(
         "loaded_file": normalized,
         "zmq_ready": False,
         "poll_attempts": attempts,
+        "possible_dialogs": _possible_dialogs(),
         "note": (
             f"Process relaunched with {normalized!r}, but nothing answered "
-            f"ZBR#ZBR_Ping within {wait_for_ready_seconds:.0f}s. Try "
+            f"ZBR#ZBR_Ping within {wait_for_ready_seconds:.0f}s. If 'possible_dialogs' "
+            "lists a dialog, it blocks the startup (see close_igor_window); otherwise try "
             "check_bridge_health() again after waiting longer."
         ),
     }
