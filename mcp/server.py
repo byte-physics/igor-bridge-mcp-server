@@ -144,7 +144,7 @@ Setup
 -----
     pip install mcp pyzmq pywin32
 
-(pywin32 is still needed for `dismiss_compile_error_dialog`'s window enumeration and
+(pywin32 is still needed for the window tools (list_igor_windows etc.) and
 for launching the Igor Pro process -- see below. It is no longer needed for, or
 involved in, talking to Igor Pro itself.)
 
@@ -179,7 +179,7 @@ from typing import Optional
 if sys.platform != "win32":
     raise RuntimeError(
         "tools/igor-mcp-bridge/server.py is Windows-only (requires pywin32 for "
-        "dismiss_compile_error_dialog's window enumeration and for launching the "
+        "the window tools (list_igor_windows etc.) and for launching the "
         "configured Igor Pro executable). It cannot run on this platform "
         f"({sys.platform!r}) -- e.g. running it by accident on a non-Windows dev "
         "machine or in CI. The ZeroMQ transport itself is cross-platform; this "
@@ -702,8 +702,8 @@ def reload_and_compile_procedures() -> dict:
     -- if Igor Pro was launched with /UNATTENDED, a genuine compile error shows up as
     a plain "<file>:<line>:<col>: error: <message>" line there (readable via
     read_session_history), rather than a modal dialog. If NOT launched /UNATTENDED, a
-    stuck "Function Compilation Error" dialog is also possible -- see
-    dismiss_compile_error_dialog. As of v2.3.1, the bridge itself should still be
+    stuck "Function Compilation Error" dialog is also possible -- this tool tries to
+    close it, see also list_igor_windows/close_igor_window. As of v2.3.1, the bridge itself should still be
     reachable in this case (see the watchdog fix above) -- fix the .ipf and call this
     tool again rather than needing to relaunch Igor Pro.
     """
@@ -1317,15 +1317,28 @@ def check_bridge_health() -> dict:
     try:
         info = call_function("ZBR#ZBR_Ping")
     except IgorZmqUnreachable as e:
+        pids = _list_igor_pids()
+        dialogs = _possible_dialogs() if pids else []
+        if not pids:
+            problem = "Igor Pro is not running."
+        elif dialogs:
+            problem = (
+                "Igor Pro is running, but does not answer. It shows the dialogs listed in "
+                "'possible_dialogs', which most likely block the bridge -- close them with "
+                "close_igor_window (or ask the user to), then check again."
+            )
+        else:
+            problem = (
+                f"Igor Pro is running, but no reply from its ZeroMQ server ({e}). It may "
+                "be busy (e.g. saving a large experiment, a long command), or "
+                "ZMQ_BridgeHelpers.ipf isn't loaded/compiled, or its ZeroMQ socket isn't "
+                f"bound to {_igor_zmq_endpoint()}."
+            )
         return {
             "status": "FAIL",
-            "problem": (
-                f"No reply from Igor Pro's ZeroMQ server ({e}). This can mean Igor "
-                "Pro isn't running, ZMQ_BridgeHelpers.ipf isn't #include-d/compiled "
-                "in the current experiment (see that file's own header comment for "
-                "the one-time setup step), or its ZeroMQ socket isn't bound to "
-                f"{_igor_zmq_endpoint()} for some other reason."
-            ),
+            "problem": problem,
+            "igor_pids": pids,
+            "possible_dialogs": dialogs,
         }
     except IgorZmqError as e:
         return {
@@ -1333,26 +1346,47 @@ def check_bridge_health() -> dict:
             "problem": f"Igor Pro's ZeroMQ server replied but reported an error: {e}",
         }
 
-    return {"status": "OK", "igor_info": info}
+    result = {"status": "OK", "igor_info": info}
+    dialogs = _possible_dialogs()
+    if dialogs:
+        result["possible_dialogs"] = dialogs
+        result["warning"] = (
+            "Igor Pro answers, but shows the dialogs listed in 'possible_dialogs'. A modal "
+            "dialog blocks Igor's operation queue, so queued commands (execute_igor_command, "
+            "run_igor_code, ...) do not run until it is closed, see close_igor_window."
+        )
+    return result
 
 
-# --- Compile-error dialog dismissal (posted Escape key message) ---------------------
+# --- Igor windows and dialogs ----------------------------------------------------------
 #
-# Unchanged from the COM-based version: this is pure OS-level window handling
-# (win32gui/win32api), entirely independent of which transport talks to Igor Pro's
-# procedure code. See the original version's extensive comment history (still
-# accurate) for how the dialog's title/class were identified live, why title-only
-# matching is used (a Copilot PR review flagged blanket "#32770" matching as unsafe),
-# and why PostMessage (not a real hardware key event) is used.
+# Pure OS-level window handling (win32gui/win32api), independent of the ZeroMQ transport.
+# A modal dialog in Igor Pro (e.g. an error of a bare Execute, "Igor Pro wants to know...",
+# a compile error without /UNATTENDED) blocks the operation queue and with it the bridge,
+# although the process itself still responds. These helpers make such dialogs visible and
+# closable without OS focus changes. Window titles are not matched against a fixed list
+# (except for the automatic compile-error dismissal), as they depend on Igor's language.
 
 _IGOR_PROCESS_NAME_PREFIX = "igor"
 _KNOWN_STUCK_DIALOG_TITLES = ("Function Compilation Error",)
 _POSTED_KEY_GAP_SECONDS = 0.05
 _POSTED_KEY_SETTLE_SECONDS = 0.2
+_CLOSE_STEP_WAIT_SECONDS = 1.0
+# "Igor Pro 9.06B01 64-bit" for an untitled experiment, "<experiment> - Igor Pro 9.06B01 64-bit"
+# otherwise; dialogs like "Igor Pro wants to know..." have no version number
+_MAIN_WINDOW_TITLE_REGEXP = re.compile(r"(^|\s-\s)Igor Pro \d+\.\d+")
 
-
-def _is_stuck_dialog_window(class_name: str, title: str) -> bool:
-    return any(known.lower() in title.lower() for known in _KNOWN_STUCK_DIALOG_TITLES)
+_KEY_CODES = {
+    "escape": win32con.VK_ESCAPE,
+    "enter": win32con.VK_RETURN,
+    "return": win32con.VK_RETURN,
+    "tab": win32con.VK_TAB,
+    "space": win32con.VK_SPACE,
+    "left": win32con.VK_LEFT,
+    "right": win32con.VK_RIGHT,
+    "up": win32con.VK_UP,
+    "down": win32con.VK_DOWN,
+}
 
 
 def _get_process_exe_name(pid: int):
@@ -1369,23 +1403,27 @@ def _get_process_exe_name(pid: int):
             win32api.CloseHandle(hProcess)
 
 
-def _list_pids_for_exe_basename(basename_lower: str) -> list:
-    """Return the PIDs of every currently running process whose own module file name
-    matches basename_lower exactly (case-insensitively), e.g. "igor64.exe".
+def _get_process_exe_path(pid: int):
+    ACCESS = win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ
+    hProcess = None
+    try:
+        hProcess = win32api.OpenProcess(ACCESS, False, pid)
+        return win32process.GetModuleFileNameEx(hProcess, 0)
+    except Exception:
+        return None
+    finally:
+        if hProcess is not None:
+            win32api.CloseHandle(hProcess)
 
-    Used by load_experiment to wait for an Igor Pro process to fully exit -- **not**
-    the same thing as it going quiet over ZeroMQ. Confirmed live (user report, this
-    session): ZeroMQ stops answering well before the underlying Igor64.exe process
-    actually terminates, and launching a replacement `Igor64.exe /UNATTENDED <path>`
-    command line while the old process is still alive -- even if it's already mid-quit
-    -- does NOT spawn a new process at all. Windows/Igor's single-instance-per-user
-    behavior instead either (a) redirects the launch request into the still-live old
-    instance, which can pop an unhandled "save changes?" dialog if it has unsaved
-    edits, or (b) if the old instance is already mid-shutdown, silently drops the
-    request altogether -- which looks exactly like the relaunch had no effect at all,
-    with no error reported anywhere. Waiting for the actual OS process list to be
-    clear of the target exe name, rather than trusting ZeroMQ silence, avoids both.
-    """
+
+def _list_pids_for_exe_basename(basename_lower: str) -> list:
+    """Return the PIDs of every running process whose module file name matches
+    basename_lower exactly (case-insensitively), e.g. "igor64.exe".
+
+    Used by load_experiment to wait for an Igor Pro process to fully exit -- **not** the
+    same thing as it going quiet over ZeroMQ: ZeroMQ stops answering well before the
+    process terminates, and launching `Igor64.exe /UNATTENDED <path>` while the old process
+    is still alive either redirects into the old instance or is silently dropped."""
     matches = []
     for pid in win32process.EnumProcesses():
         if pid == 0:
@@ -1396,115 +1434,185 @@ def _list_pids_for_exe_basename(basename_lower: str) -> list:
     return matches
 
 
-def _find_igor_dialog_window():
-    matches = []
+def _list_igor_pids() -> list:
+    pids = []
+    for pid in win32process.EnumProcesses():
+        if pid == 0:
+            continue
+        exe_name = _get_process_exe_name(pid)
+        if exe_name and exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+            pids.append(pid)
+    return pids
 
-    def _callback(hwnd, _extra):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            class_name = win32gui.GetClassName(hwnd)
-            if _is_stuck_dialog_window(class_name, title):
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                exe_name = _get_process_exe_name(pid)
-                if exe_name and exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
-                    matches.append((hwnd, title, exe_name))
+
+def _child_window_texts(hwnd) -> list:
+    """Texts of the native child controls, e.g. the message and the button captions of a
+    standard dialog. Qt windows have no native child controls, so this is empty for them."""
+    texts = []
+
+    def _callback(child, _extra):
+        try:
+            text = win32gui.GetWindowText(child)
+        except Exception:
+            text = ""
+        if text:
+            texts.append(text)
         return True
 
-    win32gui.EnumWindows(_callback, None)
-    return matches[0] if matches else None
+    try:
+        win32gui.EnumChildWindows(hwnd, _callback, None)
+    except Exception:
+        pass
+    return texts
 
 
-def _list_igor_top_level_windows() -> list:
+def _igor_windows(include_hidden: bool = False) -> list:
     windows = []
 
     def _callback(hwnd, _extra):
-        if win32gui.IsWindowVisible(hwnd):
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            exe_name = _get_process_exe_name(pid)
-            if exe_name and exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
-                windows.append(
-                    {
-                        "title": win32gui.GetWindowText(hwnd),
-                        "class_name": win32gui.GetClassName(hwnd),
-                        "process": exe_name,
-                    }
-                )
+        visible = bool(win32gui.IsWindowVisible(hwnd))
+        if not visible and not include_hidden:
+            return True
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        exe_name = _get_process_exe_name(pid)
+        if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+            return True
+        title = win32gui.GetWindowText(hwnd)
+        owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
+        windows.append(
+            {
+                "hwnd": int(hwnd),
+                "title": title,
+                "class_name": win32gui.GetClassName(hwnd),
+                "visible": visible,
+                "owner_hwnd": int(owner) if owner else None,
+                "is_main_window": bool(_MAIN_WINDOW_TITLE_REGEXP.search(title)),
+                "process": exe_name,
+                "pid": pid,
+                "child_texts": _child_window_texts(hwnd),
+            }
+        )
         return True
 
     win32gui.EnumWindows(_callback, None)
     return windows
 
 
-def _attempt_dismiss_compile_error_dialog() -> dict:
-    found = _find_igor_dialog_window()
-    if found is None:
-        return {
-            "attempted": False,
-            "reason": (
-                "No visible window with a title containing one of "
-                f"{_KNOWN_STUCK_DIALOG_TITLES}, owned by an Igor Pro process, was "
-                "found. Either there is no stuck dialog right now, or it's a kind "
-                "not seen before -- see 'igor_windows_seen' below."
-            ),
-            "igor_windows_seen": _list_igor_top_level_windows(),
-        }
+def _possible_dialogs() -> list:
+    """Visible top-level Igor windows other than the main window, typically modal dialogs
+    when the bridge does not answer."""
+    return [w for w in _igor_windows() if not w["is_main_window"] and w["title"]]
 
-    hwnd, window_title, exe_name = found
 
-    try:
-        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
-        time.sleep(_POSTED_KEY_GAP_SECONDS)
-        win32api.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
-        time.sleep(_POSTED_KEY_SETTLE_SECONDS)
-    except Exception as e:
-        return {
-            "attempted": False,
-            "reason": f"Posting the simulated Escape key press failed: {e}",
-            "dialog_window_title": window_title,
-            "dialog_window_process": exe_name,
-        }
+def _require_igor_window(hwnd: int):
+    if not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"Window {hwnd} does not exist (anymore).")
+    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    exe_name = _get_process_exe_name(pid)
+    if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+        raise RuntimeError(f"Window {hwnd} does not belong to an Igor Pro process.")
 
-    return {
-        "attempted": True,
-        "dialog_window_title": window_title,
-        "dialog_window_process": exe_name,
-        "note": (
-            "Posted a simulated Escape key press directly to this dialog window "
-            "(no OS foreground/focus change was made or needed). This does NOT "
-            "recover the actual compile-error message -- it only closes whatever "
-            "modal dialog was showing. Follow up with check_compilation_state() or "
-            "reload_and_compile_procedures() to see whether this actually un-stuck "
-            "anything."
-        ),
-    }
+
+def _post_key(hwnd: int, virtual_key: int):
+    win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, virtual_key, 0)
+    time.sleep(_POSTED_KEY_GAP_SECONDS)
+    win32api.PostMessage(hwnd, win32con.WM_KEYUP, virtual_key, 0)
+    time.sleep(_POSTED_KEY_SETTLE_SECONDS)
+
+
+def _window_gone(hwnd: int) -> bool:
+    return not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
 
 
 @mcp.tool()
-def dismiss_compile_error_dialog() -> dict:
-    """Attempt to close a stuck Igor Pro modal compile-error dialog by posting a
-    simulated Escape key press directly to it, WITHOUT recovering the actual error
-    message and WITHOUT requiring or changing OS focus/foreground state.
+def list_igor_windows(include_hidden: bool = False) -> dict:
+    """List the top-level windows of the running Igor Pro process(es), e.g. to find a modal
+    dialog which blocks the bridge.
 
-    Use this manually when you suspect Igor Pro has a compile-error dialog open (e.g.
-    reload_and_compile_procedures kept reporting "not compiled" even after fixing a
-    known syntax error). Note: launching Igor Pro with /UNATTENDED (see
-    launch_igor_pro_unattended) suppresses this dialog entirely in favor of a plain
-    history line, so this should rarely be needed for an instance launched that way.
+    Each entry has "hwnd" (for close_igor_window/send_key_to_igor_window), "title",
+    "class_name", "visible", "owner_hwnd" (dialogs are usually owned by the main window),
+    "is_main_window", "process", "pid" and "child_texts" -- the texts of native child
+    controls like the message and button captions of a standard Windows dialog (empty for
+    Igor's Qt windows, use the title then).
 
-    Mechanism: enumerates top-level windows for a visible one, owned by a process
-    whose exe name starts with "igor", whose title matches a known stuck-dialog title
-    ("Function Compilation Error", confirmed live on both Igor Pro 10.03 and 9.06,
-    both a Qt window rather than a native "#32770" dialog). Posts WM_KEYDOWN/WM_KEYUP
-    for VK_ESCAPE via PostMessage, without requiring focus or foreground.
+    Use this when the bridge does not answer although Igor Pro is running: a modal dialog
+    blocks Igor's operation queue and with it the bridge, see check_bridge_health."""
+    return {"windows": _igor_windows(include_hidden)}
 
-    If no matching window is found, reports "attempted": False along with
-    "igor_windows_seen": every visible top-level window currently owned by an Igor
-    Pro process, so a new stuck dialog's real title/class can be identified.
 
-    **Trade-off: this does not tell you what the error was.** It only clears whatever
-    dialog is blocking Igor's operation queue so work can continue.
-    """
-    return _attempt_dismiss_compile_error_dialog()
+@mcp.tool()
+def close_igor_window(hwnd: int, press_enter: bool = False) -> dict:
+    """Close a window of Igor Pro, typically a modal dialog blocking the bridge, without
+    changing the OS focus.
+
+    Tries in order: WM_CLOSE and the Escape key, and checks after each step whether the
+    window is gone. Some dialogs only react to keys, e.g. the "Igor Pro wants to know..."
+    confirmation after an error ignores WM_CLOSE but closes on Escape. Closing one dialog
+    can open the next one, so call list_igor_windows/check_bridge_health again afterward.
+
+    Dialogs without a Cancel button, e.g. a Yes/No question of DoAlert, ignore both. With
+    `press_enter`, the Enter key is tried last, which **selects the dialog's default
+    button** -- e.g. "Yes", or "Save" in a "save changes?" dialog. Only pass it when that
+    choice is fine, ask the user otherwise.
+
+    Returns {"closed": bool, "method": the step which closed it, "title": its title}."""
+    _require_igor_window(hwnd)
+    title = win32gui.GetWindowText(hwnd)
+
+    steps = (
+        ("WM_CLOSE", lambda: win32api.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)),
+        ("escape", lambda: _post_key(hwnd, win32con.VK_ESCAPE)),
+    )
+    if press_enter:
+        steps += (("enter", lambda: _post_key(hwnd, win32con.VK_RETURN)),)
+    for name, action in steps:
+        try:
+            action()
+        except Exception:
+            pass
+        deadline = time.monotonic() + _CLOSE_STEP_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if _window_gone(hwnd):
+                return {"closed": True, "method": name, "title": title}
+            time.sleep(0.1)
+
+    result = {"closed": False, "method": None, "title": title}
+    if not press_enter:
+        result["note"] = (
+            "Neither WM_CLOSE nor Escape closed it, the dialog probably has no Cancel "
+            "button. press_enter=True selects its default button."
+        )
+    return result
+
+
+@mcp.tool()
+def send_key_to_igor_window(hwnd: int, key: str) -> dict:
+    """Send a key press to a window of Igor Pro without changing the OS focus, e.g. to pick
+    a button of a dialog by its keyboard shortcut.
+
+    `key` is one of "escape", "enter"/"return", "tab", "space", "left", "right", "up",
+    "down", or a single character (e.g. "y")."""
+    _require_igor_window(hwnd)
+    name = key.lower()
+    if name in _KEY_CODES:
+        virtual_key = _KEY_CODES[name]
+    elif len(key) == 1:
+        virtual_key = win32api.VkKeyScan(key) & 0xFF
+    else:
+        raise RuntimeError(f"Unknown key {key!r}.")
+
+    _post_key(hwnd, virtual_key)
+    return {"sent": True, "key": key, "window_still_open": not _window_gone(hwnd)}
+
+
+def _attempt_dismiss_compile_error_dialog() -> dict:
+    """Close a "Function Compilation Error" dialog (only shown if Igor Pro was not launched
+    with /UNATTENDED), see reload_and_compile_procedures."""
+    for window in _possible_dialogs():
+        if any(t.lower() in window["title"].lower() for t in _KNOWN_STUCK_DIALOG_TITLES):
+            result = close_igor_window(window["hwnd"])
+            return {"attempted": True, **result}
+    return {"attempted": False, "igor_windows_seen": _possible_dialogs()}
 
 
 # --- Launching / relaunching Igor Pro -------------------------------------------------

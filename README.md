@@ -25,8 +25,12 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   `read_session_history` reads back everything sent to Igor's history area.
 - **Compilation management** — `check_compilation_state` /
   `reload_and_compile_procedures` check and refresh Igor's compiled state
-  after editing a `.ipf` file on disk; `dismiss_compile_error_dialog` closes a
-  stuck "Function Compilation Error" dialog without needing OS focus.
+  after editing a `.ipf` file on disk.
+- **Windows and dialogs** — `list_igor_windows` lists Igor's top-level windows,
+  e.g. a modal dialog blocking the bridge; `close_igor_window` closes one
+  (WM_CLOSE, Escape, and only on request Enter, which selects the default
+  button) and `send_key_to_igor_window` sends a key, both without needing OS
+  focus. `check_bridge_health` reports such dialogs.
 - **Debugger control** — `get_debugger_state` / `set_debugger_enabled` /
   `restore_debugger_settings` read, change, and restore Igor's Debugger
   settings (must be disabled for unattended/automated use).

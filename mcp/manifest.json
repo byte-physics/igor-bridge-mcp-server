@@ -74,8 +74,16 @@
       "description": "Reload changed .ipf files from disk and attempt a fresh compilation, reporting the resulting compiled state."
     },
     {
-      "name": "dismiss_compile_error_dialog",
-      "description": "Attempt to close a stuck Igor Pro compile-error dialog by posting a simulated Escape key press to it."
+      "name": "list_igor_windows",
+      "description": "List the top-level windows of Igor Pro, e.g. a modal dialog blocking the bridge"
+    },
+    {
+      "name": "close_igor_window",
+      "description": "Close a window or dialog of Igor Pro via WM_CLOSE or Escape (Enter, i.e. the default button, only on request) without changing the focus"
+    },
+    {
+      "name": "send_key_to_igor_window",
+      "description": "Send a key press to a window or dialog of Igor Pro without changing the focus"
     },
     {
       "name": "get_debugger_state",
