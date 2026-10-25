@@ -4,6 +4,12 @@ Igor Pro MCP bridge server
 
 Exposes a running Igor Pro instance to Claude (or any MCP client) as a set of MCP tools.
 
+**v3.0.0**: `run_igor_code` runs code as compiled ProcGlobal functions via the scratch
+procedures in procedure/ZBR_UserProcedures, and commands run in ProcGlobal context once
+those are included; queued commands never open modal dialogs; tools for Igor's windows and
+dialogs, IgorTest runs, symbol lookups and help file editing. The two `_unattended` tools
+and `dismiss_compile_error_dialog` are removed, see the manifest's long_description.
+
 **v2.0.0: transport rewritten from COM to ZeroMQ.** Versions through 1.27.0 talked to
 Igor Pro as a COM Automation *client* (win32com, `IgorPro.Application`, `Execute2`).
 From 2.0.0 on, this bridge instead talks to Igor Pro's ZeroMQ-XOP
@@ -1716,7 +1722,7 @@ def edit_help_file(
 # reason as before: the on-disk layout after Claude Desktop installs a .mcpb isn't
 # guaranteed to keep server.py and manifest.json at a fixed relative path, and this
 # needs to be confirmable from inside a conversation independent of that.
-_BRIDGE_VERSION = "2.3.2"
+_BRIDGE_VERSION = "3.0.0"
 
 
 def _installed_package_version(distribution_name: str) -> str | None:

@@ -5,7 +5,7 @@
 Facts, corrections, and design rationale for the Igor Pro Bridge MCP server. Kept here so
 both the user and Claude can recall them accurately in later sessions rather than
 re-deriving or re-arguing them from scratch. Organized by topic, not chronology, and
-scoped to facts relevant to the *current* (ZeroMQ-based, v2.3.2) bridge.
+scoped to facts relevant to the *current* (ZeroMQ-based, v3.0.0) bridge.
 
 ## Standing instructions
 
@@ -429,3 +429,32 @@ follow-up calls instead of re-declaring.
   quotes and newlines (confirmed live: this mangled a multi-line Python snippet with
   f-strings into a `SyntaxError` when first tried inline). A temp file sidesteps
   command-line quoting/escaping entirely.
+
+## v3.0.0: Execution contexts and scratch procedures
+
+- `Execute` inside a function of the ZBR independent module resolves names in the module's
+  context: the experiment's constants are unknown there, and `exists()`/`FunctionInfo()` report
+  nothing for its functions. Only `Execute/P` runs in ProcGlobal like Igor's own command line
+  (verified: `Execute/P "print <MIES constant>"` prints its value), but leaves a global `V_flag`
+  behind. `ZBR_PG_RunCommand` in `procedure/ZBR_UserProcedures/ZBR_ProcGlobal.ipf` compiles in
+  ProcGlobal and runs the command with `Execute/Z` inside a function: ProcGlobal name
+  resolution and a local `V_flag`.
+- `ZBR_ProcGlobal.ipf` is not loaded globally but added with `INSERTINCLUDE` on demand, which
+  writes an `#include` line into the experiment's Procedure window (saved with the experiment).
+  The folder is linked into "User Procedures" so that `#include`/`INSERTINCLUDE` find it; a link
+  in "Igor Procedures" would load it into every experiment at startup instead.
+- `run_igor_code` overwrites `ZBR_Scratch.ipf` on every call and never empties it afterward
+  without recompiling: a file changed on disk makes Igor Pro go uncompiled later, when it
+  notices the change, possibly in the middle of a running acquisition or test.
+- Queue entries without `/Z` open a modal dialog on an error (e.g. "unknown/inappropriate name or
+  symbol ZBR#ZBR_RunCommand(6)" for an unknown constant), which blocks the operation queue and
+  with it the bridge. All queued entries use `Execute/P/Q/Z` now.
+- Closing procedure windows (`CloseProc`) immediately followed by a recompile crashed Igor 9.06
+  (access violation in Igor64.exe). The scratch procedures therefore never close or create
+  procedure windows; they only rewrite the file on disk and reload.
+- The ZeroMQ-XOP has no silent way to tell whether our socket is still bound. A bind attempt
+  prints "Address in use" into the history (a background task retrying it every 10 s filled
+  the history), and `zeromq_handler_start()` reports a running handler also after MIES's
+  `StartZeroMQSockets(forceRestart = 1)` called `zeromq_stop()` and restarted the handler with
+  only its own binds. The background task `ZBR_BindKeeper` therefore only rebinds when the
+  bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.

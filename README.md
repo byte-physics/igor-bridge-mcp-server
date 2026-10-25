@@ -82,7 +82,7 @@ Claude Desktop session running on the same Windows machine as Igor Pro.
    `Get-Help ./install.ps1 -Full` for details.
 
 3. **Install the Claude Desktop extension (`.mcpb`)**. A pre-built package is
-   included at `mcp/igor-pro-bridge-2.3.2.mcpb`. In Claude Desktop, go to
+   included at `mcp/igor-pro-bridge-<version>.mcpb` (build a new one with `mcpb pack mcp`). In Claude Desktop, go to
    Settings → Extensions → Advanced settings → Extension Developer → Install
    Extension, and select that file. Do not register this bridge by manually
    editing `claude_desktop_config.json` — that does not work reliably for
@@ -102,6 +102,22 @@ Claude Desktop session running on the same Windows machine as Igor Pro.
 The general idea is that you have some repository / folder where your .ipf files are that you work on. Allow Claude write access to this folder.
 Then it can edit these files on disk and reload the changes in Igor Pro and recompile.
 It is worthwhile to hint Claude that it should read the Igor Help for specific tasks first as it has a dedicated function for this included.
+
+## Working with the bridge
+
+- **`run_igor_code` is the default for running code.** It runs as a compiled ProcGlobal function:
+  flow control, local variables, WAVE/NVAR/SVAR references and the experiment's own constants and
+  functions all work. Use `print` to return data.
+- **`execute_igor_command` is for quick queries** and for what only works outside functions, e.g.
+  `Quit` or `Execute/P ...`. On Igor's command line, results of built-in functions must be printed or
+  assigned, there is no flow control, and SVAR/NVAR/WAVE references are not allowed.
+- **Recompiling stops background tasks.** `run_igor_code` recompiles every time and refuses while
+  named background tasks run (e.g. a data acquisition); call already compiled code with
+  `execute_igor_command` then.
+- **Reload before tests.** `run_igor_tests` compiles changed procedure files first, otherwise Igor Pro
+  goes uncompiled in the middle of the run when it notices them.
+- **When the bridge does not answer**, `check_bridge_health` tells whether Igor Pro runs, is busy or
+  shows a dialog; `list_igor_windows`/`close_igor_window` close such dialogs.
 
 ## Advanced Use
 
