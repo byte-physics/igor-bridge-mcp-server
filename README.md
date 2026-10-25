@@ -20,6 +20,9 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   Reliable across bridge/Claude Desktop restarts, and across waits of any length
   (hours to weeks), since all state lives in Igor Pro's own data waves, not in this
   bridge's process.
+- **Tests** — `run_igor_tests` compiles changed procedures and starts a test run of
+  [IgorTest](https://github.com/byte-physics/igortest); `get_igor_test_results` returns
+  its results from the JUnit output once the run has finished.
 - **Read data back** — `get_wave` returns an existing wave's full data and
   metadata (any dimensionality, numeric/complex/text/wave-reference).
   `read_session_history` reads back everything sent to Igor's history area.

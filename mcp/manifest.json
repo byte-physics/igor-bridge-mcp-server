@@ -50,6 +50,14 @@
       "description": "Remove the bridge's scratch procedures (INSERTINCLUDE) from the experiment again"
     },
     {
+      "name": "run_igor_tests",
+      "description": "Compile and start a test run of IgorTest, returning immediately"
+    },
+    {
+      "name": "get_igor_test_results",
+      "description": "Return the results of an IgorTest run from its JUnit output once finished"
+    },
+    {
       "name": "read_session_history",
       "description": "Read back everything sent to Igor's history area since this bridge's capture started."
     },

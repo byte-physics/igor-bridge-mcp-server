@@ -327,6 +327,17 @@ static Function ZBR_QueueCommand(string token, string cmd)
 	return 0
 End
 
+/// Return the native path of the experiment's home folder, or "" for an unsaved experiment
+Function/S ZBR_GetHomePath()
+
+	PathInfo home
+	if(!V_flag)
+		return ""
+	endif
+
+	return ParseFilePath(5, S_path, "\\", 0, 0)
+End
+
 // --- ProcGlobal part ---------------------------------------------------------------------
 
 /// Return 1 if ZBR_ProcGlobal.ipf is included and compiled, 0 otherwise

@@ -949,6 +949,152 @@ def remove_scratch_procedures() -> dict:
     return {"removed": True, "compile": result}
 
 
+# --- Tests (IgorTest) -----------------------------------------------------------------
+#
+# A test run of IgorTest (https://github.com/byte-physics/igortest) often outlives a single
+# MCP tool call: test cases with reentry continue in background tasks after the starting
+# command returned. The run is therefore started by run_igor_tests and its JUnit output,
+# which IgorTest writes at the very end, is collected by get_igor_test_results.
+
+_JUNIT_FILE_PATTERN = re.compile(r"^JU_.*\.xml$", re.IGNORECASE)
+_JUNIT_STABLE_SECONDS = 1.0
+
+
+def _junit_files(folder: str) -> dict:
+    """{path: modification time} of the JUnit files of IgorTest in `folder`."""
+    result = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return result
+    for name in names:
+        if _JUNIT_FILE_PATTERN.match(name):
+            path = os.path.join(folder, name)
+            try:
+                result[path] = os.path.getmtime(path)
+            except OSError:
+                pass
+    return result
+
+
+def _parse_junit(path: str) -> dict:
+    import xml.etree.ElementTree as ElementTree
+
+    root = ElementTree.parse(path).getroot()
+    suites = []
+    failures = []
+    for suite in root.iter("testsuite"):
+        name = suite.get("name", "")
+        if name.startswith("@"):  # IgorTest's own hook/data generator pseudo suites
+            continue
+        suites.append(
+            {
+                "name": name,
+                "tests": int(suite.get("tests", 0)),
+                "failures": int(suite.get("failures", 0)),
+                "errors": int(suite.get("errors", 0)),
+                "skipped": int(suite.get("skipped", 0)),
+                "time": float(suite.get("time", 0) or 0),
+            }
+        )
+        for case in suite.iter("testcase"):
+            for kind in ("failure", "error"):
+                for problem in case.findall(kind):
+                    failures.append(
+                        {
+                            "suite": name,
+                            "test_case": case.get("name", ""),
+                            "kind": kind,
+                            "message": problem.get("message", ""),
+                        }
+                    )
+
+    total = {
+        key: sum(suite[key] for suite in suites)
+        for key in ("tests", "failures", "errors", "skipped")
+    }
+    return {"junit_file": path, "total": total, "suites": suites, "failures": failures}
+
+
+def _default_junit_folder() -> str:
+    folder = call_function("ZBR#ZBR_GetHomePath")
+    if not folder:
+        raise RuntimeError(
+            "The experiment is not saved, so it has no home folder for the JUnit output. "
+            "Pass junit_folder explicitly."
+        )
+    return folder
+
+
+@mcp.tool()
+def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = True) -> dict:
+    """Start a test run of IgorTest and return immediately; collect the results later with
+    get_igor_test_results.
+
+    `command` starts the run and must enable the JUnit output of IgorTest, e.g.
+    `RunTest("MyTests.ipf", enableJU = 1)` or a project wrapper around it. `junit_folder` is
+    where IgorTest writes its JU_*.xml file, by default the experiment's home folder.
+
+    With `compile_first` (default), procedure files changed on disk are reloaded and
+    compiled before the run starts. Otherwise Igor Pro notices the change later, e.g. when
+    a window is activated, and goes uncompiled in the middle of the run, which stops test
+    cases running in background tasks.
+
+    The command runs with Igor's Debugger disabled, see execute_igor_command.
+
+    Returns {"started_at": time stamp to pass to get_igor_test_results, "junit_folder",
+    "token" of the starting command, "compile": result of the compile step}."""
+    folder = junit_folder or _default_junit_folder()
+
+    compile_result = None
+    if compile_first:
+        compile_result = _reload_and_compile()
+        if not compile_result.get("compiled"):
+            return {"started": False, "compile": compile_result}
+
+    started_at = time.time()
+    token = call_function("ZBR#ZBR_SubmitCommandUnattended", [command])
+    return {
+        "started": True,
+        "started_at": started_at,
+        "junit_folder": folder,
+        "token": token,
+        "compile": compile_result,
+    }
+
+
+@mcp.tool()
+def get_igor_test_results(junit_folder: str, started_at: float = 0.0) -> dict:
+    """Return the results of a test run of IgorTest from its JUnit output, see
+    run_igor_tests.
+
+    Looks for the newest JU_*.xml file in `junit_folder` written after `started_at` (as
+    returned by run_igor_tests; 0 takes the newest file). Returns {"finished": False} while
+    there is none yet or it is still being written -- call again later, the test run itself
+    is not affected.
+
+    Once finished: {"finished": True, "junit_file", "total": {"tests", "failures",
+    "errors", "skipped"}, "suites": per test suite, "failures": every failed assertion or
+    error with its test case and message}."""
+    files = {
+        path: mtime
+        for path, mtime in _junit_files(junit_folder).items()
+        if mtime >= started_at
+    }
+    if not files:
+        return {"finished": False}
+
+    newest = max(files, key=files.get)
+    if time.time() - files[newest] < _JUNIT_STABLE_SECONDS:
+        return {"finished": False, "note": f"{newest} is still being written."}
+
+    try:
+        result = _parse_junit(newest)
+    except Exception as e:
+        return {"finished": False, "note": f"Could not parse {newest} yet: {e}"}
+    return {"finished": True, **result}
+
+
 # --- Debugger control --------------------------------------------------------------
 #
 # Unchanged in spirit from the COM-based version -- see that version's extensive
