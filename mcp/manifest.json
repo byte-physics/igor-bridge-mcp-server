@@ -31,23 +31,23 @@
   "tools": [
     {
       "name": "execute_igor_command",
-      "description": "Execute a single Igor Pro command string in the running Igor instance (submit/poll over ZeroMQ). Include a print call (not fprintf 0, ...) to get data back. Returns {results, history}."
-    },
-    {
-      "name": "execute_igor_command_unattended",
-      "description": "Same as execute_igor_command, but disables Igor's Debugger for the duration of the call and restores it afterward."
+      "description": "Run a command line in Igor Pro and return its output and error; prefer run_igor_code for more than a short command"
     },
     {
       "name": "submit_igor_command",
-      "description": "Queue a command for deferred execution and return a token immediately, without waiting for it to finish. Use for commands with an unknown or long (hours to weeks) runtime instead of execute_igor_command. Poll completion with poll_igor_command. Guaranteed (as of v2.2.0) to always reach done=true eventually, even if the command fails to parse or errors partway through."
-    },
-    {
-      "name": "submit_igor_command_unattended",
-      "description": "Same as submit_igor_command, but disables Igor's Debugger for the duration of the command and restores it afterward. Recommended for anything long-running."
+      "description": "Queue a long-running command and return a token for poll_igor_command"
     },
     {
       "name": "poll_igor_command",
       "description": "Check whether a command submitted via submit_igor_command/submit_igor_command_unattended has finished yet, and retrieve its captured output if so. Safe to call any number of times, spaced arbitrarily far apart."
+    },
+    {
+      "name": "run_igor_code",
+      "description": "Compile and run procedure code as a ProcGlobal function via the bridge's scratch procedure file"
+    },
+    {
+      "name": "remove_scratch_procedures",
+      "description": "Remove the bridge's scratch procedures (INSERTINCLUDE) from the experiment again"
     },
     {
       "name": "read_session_history",

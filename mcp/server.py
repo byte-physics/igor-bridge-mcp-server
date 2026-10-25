@@ -75,7 +75,7 @@ instance, and against https://github.com/AllenInstitute/ZeroMQ-XOP's own README)
   only after the calling function returns) is legal there. This means a single
   CallFunction round trip cannot synchronously "run this arbitrary command string and
   hand back what it printed" -- there is no direct equivalent of the COM bridge's
-  `Execute2`. `execute_igor_command`/`execute_igor_command_unattended` below instead
+  `Execute2`. `execute_igor_command` below instead
   use a submit-then-poll pattern (`ZBR_SubmitCommand`/`ZBR_SubmitCommandUnattended`
   queue the command and return a token immediately; `ZBR_PollCommand`, called via a
   LATER separate request, reports completion and the captured output). Every OTHER
@@ -83,13 +83,13 @@ instance, and against https://github.com/AllenInstitute/ZeroMQ-XOP's own README)
   check_compilation_state, get_debugger_state, get_environment_summary's underlying
   queries, read_help_file, etc.) is backed by a small, purpose-built, directly-callable
   Igor function instead, and is a single synchronous round trip -- no polling needed.
-- **Commands with an unknown or long runtime (v2.1.0+)**: `execute_igor_command`/
-  `execute_igor_command_unattended` block the whole MCP tool call while polling, up to
+- **Commands with an unknown or long runtime (v2.1.0+)**: `execute_igor_command`
+  blocks the whole MCP tool call while polling, up to
   their own `timeout_seconds` -- workable for anything expected to finish in seconds,
   but not for a calculation that might run for hours or weeks, since the underlying
   MCP transport itself has been observed to time out a single tool call well under a
-  minute regardless of what `timeout_seconds` requests. `submit_igor_command`/
-  `submit_igor_command_unattended` expose the same submit step as its own tool
+  minute regardless of what `timeout_seconds` requests. `submit_igor_command`
+  exposes the same submit step as its own tool
   (returns a token immediately, no waiting at all), and `poll_igor_command(token)`
   exposes the same poll step as its own tool (one cheap, instant check, callable any
   number of times, spaced arbitrarily far apart). Because all of the actual state
@@ -101,19 +101,16 @@ instance, and against https://github.com/AllenInstitute/ZeroMQ-XOP's own README)
 
 **Behavior changes from the COM version worth knowing about**:
 
-- `execute_igor_command`/`execute_igor_command_unattended` no longer return a clean,
-  separately-captured "results" (fprintf-only output) distinct from "history" (full
-  history including the echoed command) -- COM's `Execute2` had special handling to
-  split these; this transport cannot replicate that, since the submit/poll mechanism
-  only has Igor's own history-diffing (`CaptureHistory`) to go on. Both keys are now
-  populated with the same text (everything printed to history while the command ran,
-  including its own echo). Prefix a command with `Silent 1;` if you want the echo
+- `execute_igor_command` returns everything printed to the history while the command
+  ran, including its own echo, as "output" -- COM's `Execute2` could separate fprintf
+  output from the history, this transport only has Igor's own history-diffing
+  (`CaptureHistory`) to go on. Prefix a command with `Silent 1;` if you want the echo
   suppressed from the returned text.
 - **Use `print`, not `fprintf 0, ...`, to get data back.** Confirmed live this
   session: `CaptureHistory` (which the submit/poll mechanism above relies on)
   captures `print` output but does NOT capture `fprintf`-to-history-refnum output at
   all, whether directed at refnum 0 (history), -1, or -2 -- a command consisting of
-  only `fprintf 0, "..."` runs without error but returns empty "results"/"history"
+  only `fprintf 0, "..."` runs without error but returns an empty "output"
   every time, even though the exact same value printed via `print` is captured
   correctly. This is a real behavior change from the COM version, whose `Execute2`
   had its own dedicated mechanism for capturing `fprintf(0,...)` output specifically
@@ -456,185 +453,92 @@ def _submit_and_poll(submit_function: str, command: str, timeout_seconds: float)
         time.sleep(_SUBMIT_POLL_INTERVAL_SECONDS)
 
 
+def _split_error(text: str) -> tuple:
+    """ZBR_FinishToken() prefixes the captured text with "ERROR: <message>" when the command
+    failed; split that into (output, error)."""
+    if isinstance(text, str) and text.startswith("ERROR: "):
+        first, _, rest = text.partition("\r")
+        return rest, first[len("ERROR: ") :]
+    return text, ""
+
+
+def _submit_function(debugger: bool) -> str:
+    return "ZBR_SubmitCommand" if debugger else "ZBR_SubmitCommandUnattended"
+
+
 @mcp.tool()
 def execute_igor_command(
-    command: str, timeout_seconds: float = _SUBMIT_POLL_TIMEOUT_SECONDS
+    command: str,
+    timeout_seconds: float = _SUBMIT_POLL_TIMEOUT_SECONDS,
+    debugger: bool = False,
 ) -> dict:
-    """Execute a single Igor Pro command string in the running Igor instance.
+    """Run a single command line in the running Igor Pro instance and return what it
+    printed.
 
-    **If `command`'s runtime is unknown or could be long (more than roughly a
-    minute), use submit_igor_command/poll_igor_command instead.** This tool blocks
-    the whole MCP call for up to `timeout_seconds` and will itself get killed by
-    Claude Desktop's own MCP request timeout well before that if `timeout_seconds`
-    is set too high -- it is only suitable for commands expected to finish quickly.
+    **Prefer run_igor_code for anything beyond a short command.** The command line has no
+    flow control, results of built-in functions must be printed or assigned, and SVAR/NVAR/
+    WAVE references are not allowed. run_igor_code runs the same as compiled function code.
+    Use this tool for quick queries, for operations which only work outside functions
+    (e.g. `Quit`, `Execute/P ...`), and for calling already compiled code while background
+    tasks run that a recompile would stop.
 
-    **To get data back, include a `print` call in `command` -- NOT `fprintf 0, ...`.**
-    Confirmed live: this transport's capture mechanism (`CaptureHistory`) picks up
-    `print` output but does not capture `fprintf`-to-history output at all (refnum 0,
-    -1, or -2 all silently produce nothing) -- see the module docstring's "Behavior
-    changes" section for why (the old COM-based Execute2 had its own separate
-    mechanism specifically for fprintf(0,...), which no longer applies here).
-    Whatever `print`s (and the echoed command itself, unless prefixed with
-    `Silent 1;`) is captured and returned in both "results" and "history" (see the
-    module docstring for why this transport can no longer separate the two the way
-    Execute2 did).
+    Context: if ZBR_ProcGlobal.ipf is included (run_igor_code adds it), the command runs in
+    ProcGlobal context, so the experiment's constants, functions and macros resolve as on
+    Igor's own command line. Otherwise it runs in the bridge's independent module, where
+    only calls of ProcGlobal functions are resolved and constants are unknown.
+
+    To get data back, use `print` (CaptureHistory does not capture `fprintf` to the history).
+    For a command with an unknown or long runtime, use submit_igor_command/
+    poll_igor_command instead: this tool blocks until the command finishes or
+    `timeout_seconds` elapses.
+
+    `debugger` (default False) keeps Igor's Debugger as it is. By default it is disabled
+    for the command and restored afterward, as a Debugger pause in procedure code cannot be
+    resumed by the bridge and would hang the command (see set_debugger_enabled).
+
+    Errors never open a modal dialog. Returns {"output": captured history text, "error":
+    error message or ""}.
 
     Example: execute_igor_command('WaveStats/Q jack; print V_avg')
-
-    Implementation note: this queues `command` (ZBR_SubmitCommand) and polls for
-    completion (ZBR_PollCommand) rather than running it in one synchronous round trip
-    -- Igor's Execute operation cannot run unqueued from inside a Function at all, so
-    there is no direct equivalent of COM's Execute2 here. `timeout_seconds` bounds how
-    long this will poll before giving up (raises TimeoutError-style RuntimeError).
-
-    **Caution:** if `command` calls user-defined procedure code and Igor Pro's
-    Debugger is currently enabled, a breakpoint/runtime error/abort/stale-reference
-    pause in that code will hang the underlying command indefinitely (this poll loop
-    will keep timing out and retrying, never actually seeing it finish) -- there is no
-    scriptable way to resume or dismiss the Debugger window (see set_debugger_enabled's
-    docstring). Use execute_igor_command_unattended instead whenever nobody is
-    watching who could close that popup manually.
-
-    **If `command` itself fails to parse or hits a genuine Igor-level runtime error
-    (Debugger not involved), this now still returns normally instead of hanging until
-    `timeout_seconds` expires** -- confirmed live for both cases. There is currently no
-    way to tell that apart from "ran fine and printed nothing", though: the returned
-    text will simply be shorter/emptier than expected, with no error indication. If
-    verifying success matters, have `command` `print` an explicit sentinel/result
-    value itself.
     """
-    text = _submit_and_poll("ZBR_SubmitCommand", command, timeout_seconds)
-    return {"results": text, "history": text}
-
-
-@mcp.tool()
-def execute_igor_command_unattended(
-    command: str, timeout_seconds: float = _SUBMIT_POLL_TIMEOUT_SECONDS
-) -> dict:
-    """Run `command` exactly like execute_igor_command, but automatically disable
-    Igor's Debugger before running it and restore it again afterward -- even if
-    `command` raises an Igor-level error.
-
-    **This is the tool to reach for whenever `command` might call user-defined
-    procedure code and nothing is watching that could close a Debugger popup by
-    hand.** See set_debugger_enabled's docstring for why a Debugger pause has no
-    scriptable resume.
-
-    Only reach for plain execute_igor_command when you deliberately want the Debugger
-    available (e.g. interactively testing a breakpoint).
-    """
-    text = _submit_and_poll("ZBR_SubmitCommandUnattended", command, timeout_seconds)
-    return {"results": text, "history": text}
+    text = _submit_and_poll(_submit_function(debugger), command, timeout_seconds)
+    output, error = _split_error(text)
+    return {"output": output, "error": error}
 
 
 _UNKNOWN_TOKEN_PREFIX = "ERROR: unknown token "
 
 
 @mcp.tool()
-def submit_igor_command(command: str) -> dict:
-    """Queue `command` for deferred execution and return a token immediately, WITHOUT
-    waiting for it to finish.
+def submit_igor_command(command: str, debugger: bool = False) -> dict:
+    """Queue `command` for deferred execution and return a token immediately, without
+    waiting for it to finish -- for commands with an unknown or long runtime (minutes up to
+    weeks). Check it with poll_igor_command(token), as often and as far apart as needed.
 
-    **Use this instead of execute_igor_command whenever a command's runtime is
-    unknown or could be long -- minutes, hours, even weeks.** execute_igor_command
-    blocks the entire MCP tool call until the command finishes or timeout_seconds
-    elapses, which cannot work for a genuinely long-running calculation: it will hit
-    Claude Desktop's own MCP request timeout (observed in practice to trigger in well
-    under a minute) long before a multi-hour command finishes, even though the
-    command itself keeps running in Igor Pro regardless of what the MCP call does.
-
-    Call poll_igor_command(token) afterward -- as many times as needed, spaced
-    however far apart in time you like -- to check whether it's done yet and
-    retrieve its output once it is.
-
-    **Why this is reliable even across very long waits**: the token is just a row
-    index into plain data waves in root:Packages:ZBR (done/resultText), maintained
-    entirely by Igor Pro itself. Nothing about polling it later depends on this
-    bridge's own Python process, on any particular MCP/Claude Desktop session
-    staying open, or on how much time passes between calls -- this bridge process
-    restarting, or Claude Desktop being closed and reopened, does not lose or
-    invalidate the token. The one thing that DOES end the underlying job is Igor
-    Pro itself quitting, crashing, or restarting -- in that case the computation
-    itself is gone, not just the token, so there is nothing to recover regardless of
-    transport.
-
-    **Caution:** if `command` calls user-defined procedure code and Igor Pro's
-    Debugger is enabled, a breakpoint/runtime error/abort/stale-reference pause
-    leaves poll_igor_command reporting "not done" forever -- indistinguishable from
-    a command that's still genuinely, legitimately running, since there is no
-    scriptable way to detect or resume a Debugger pause (see
-    set_debugger_enabled's docstring). **Use submit_igor_command_unattended instead
-    for anything long-running -- this matters far more here than for
-    execute_igor_command, since nobody is likely to be watching a job that might run
-    for weeks.**
-
-    **Separately (Debugger not involved): `command` failing to parse, or hitting a
-    genuine Igor-level runtime error partway through, will NOT leave the token stuck
-    forever** -- confirmed live. The finish-callback that flips poll_igor_command's
-    "done" flag is queued as its own independent step, so it always runs regardless
-    of what happens to `command`. There is, however, no reliable generic way to tell
-    "command ran and legitimately printed nothing" apart from "command errored out
-    with no output" -- both come back from poll_igor_command as `"done": True` with
-    an empty/short result and no error indication. If verifying success matters, have
-    `command` `print` an explicit sentinel/result value itself.
-    """
-    token = call_function("ZBR#ZBR_SubmitCommand", [command])
-    return {"token": token}
-
-
-@mcp.tool()
-def submit_igor_command_unattended(command: str) -> dict:
-    """Same as submit_igor_command, but disables Igor's Debugger for the duration of
-    `command` and restores it afterward -- see execute_igor_command_unattended's
-    docstring for the general reasoning.
-
-    **This is the recommended tool for anything long-running submitted via
-    submit_igor_command/poll_igor_command.** Without it, a Debugger pause partway
-    through a multi-hour or multi-week calculation would silently hang forever with
-    no way to distinguish it from the command still legitimately running -- there is
-    no periodic "is this actually still making progress" signal beyond
-    poll_igor_command's own done/not-done state.
-    """
-    token = call_function("ZBR#ZBR_SubmitCommandUnattended", [command])
+    The token is a row in waves of root:Packages:ZBR maintained by Igor Pro itself, so it
+    stays valid across restarts of this bridge or Claude Desktop; only Igor Pro quitting
+    ends the job and its token. See execute_igor_command for the command context and the
+    `debugger` argument -- keep the Debugger disabled (the default) for long jobs, a
+    Debugger pause would otherwise look like a job still running."""
+    token = call_function(f"ZBR#{_submit_function(debugger)}", [command])
     return {"token": token}
 
 
 @mcp.tool()
 def poll_igor_command(token: str) -> dict:
-    """Check whether a command submitted via submit_igor_command/
-    submit_igor_command_unattended has finished yet, and retrieve its captured
-    output if so.
+    """Check whether a command of submit_igor_command has finished, and return its output
+    if so.
 
-    Returns `{"done": False}` while still pending -- call again later, there is no
-    limit on how long you can wait or how many times you poll (see
-    submit_igor_command's docstring for why this stays reliable no matter how much
-    time passes or how many times this bridge process itself restarts in the
-    meantime). Returns `{"done": True, "results": <text>, "history": <text>}` once
-    finished -- both keys hold the same captured text, matching
-    execute_igor_command's own return shape (see that tool's docstring for why
-    "results"/"history" can no longer be kept separate over this transport, and why
-    `print`, not `fprintf`, is what actually gets captured).
-
-    For a job expected to run over a very long horizon (hours to weeks), consider
-    setting up a scheduled task that calls this periodically and reports back once
-    `"done"` flips to true, rather than relying on this conversation staying open.
-
-    Raises if `token` is not recognized -- e.g. a typo, or a token from a
-    since-quit/since-restarted Igor Pro instance (tokens do not survive Igor Pro
-    itself restarting, only this bridge process or Claude Desktop restarting).
-
-    Does NOT raise just because the submitted command itself failed to parse or hit
-    a runtime error -- that case still reports `"done": True`, just with an
-    empty/shorter-than-expected result and no explicit error indication (see
-    submit_igor_command's docstring for why: there is currently no generic way to
-    detect this here).
-    """
+    Returns {"done": False} while pending, otherwise {"done": True, "output": captured
+    history text, "error": error message or ""}. Raises if `token` is unknown, e.g. from an
+    Igor Pro instance which has quit since."""
     is_done, text = call_function("ZBR#ZBR_PollCommand", [token])
     if not is_done:
         return {"done": False}
     if isinstance(text, str) and text.startswith(_UNKNOWN_TOKEN_PREFIX):
         raise RuntimeError(text)
-    return {"done": True, "results": text, "history": text}
+    output, error = _split_error(text)
+    return {"done": True, "output": output, "error": error}
 
 
 @mcp.tool()
@@ -642,7 +546,7 @@ def read_session_history(stop: bool = False) -> dict:
     """Read back everything sent to Igor's history area (print output, command
     echoing, error messages, etc.) since this bridge (specifically, ZMQ_BridgeHelpers.
     ipf's own capture) started tracking it -- the reliable way to verify a PAST
-    execute_igor_command/execute_igor_command_unattended call's output actually
+    execute_igor_command call's output actually
     happened, without asking a human to look at Igor's screen.
 
     A capture is started automatically, Igor-side, the first time it's needed (see
@@ -997,10 +901,7 @@ def run_igor_code(
 
     command = call or f"{_SCRATCH_MAIN_FUNCTION}()"
     text = _submit_and_poll("ZBR_SubmitCommandUnattended", command, timeout_seconds)
-    error = ""
-    if text.startswith("ERROR: "):
-        first, _, text = text.partition("\r")
-        error = first[len("ERROR: ") :]
+    text, error = _split_error(text)
 
     return {"compiled": True, "output": text, "error": error, "compile": compile_result}
 

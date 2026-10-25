@@ -9,15 +9,17 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
 
 ## Key functions
 
-- **Run commands** — `execute_igor_command` / `execute_igor_command_unattended`
-  run a command string on Igor's command line and return what it printed
-  (`_unattended` also disables/restores Igor's Debugger around the call, so a
-  runtime error can't pop an undismissable modal dialog).
-- **Long-running commands** — `submit_igor_command` / `submit_igor_command_unattended`
-  queue a command and return a token immediately without waiting; `poll_igor_command`
-  checks completion later. Reliable across bridge/Claude Desktop restarts, and
-  across waits of any length (hours to weeks), since all state lives in Igor
-  Pro's own data waves, not in this bridge's process.
+- **Run code** — `run_igor_code` compiles and runs procedure code as a ProcGlobal
+  function (flow control, local variables, the experiment's own constants and functions).
+  It is the default way to run anything beyond a short command.
+- **Run commands** — `execute_igor_command` runs a command line and returns what it
+  printed and its error message. By default Igor's Debugger is disabled for the call,
+  so a Debugger pause can't hang it; errors never open a modal dialog.
+- **Long-running commands** — `submit_igor_command` queues a command and returns a
+  token immediately without waiting; `poll_igor_command` checks completion later.
+  Reliable across bridge/Claude Desktop restarts, and across waits of any length
+  (hours to weeks), since all state lives in Igor Pro's own data waves, not in this
+  bridge's process.
 - **Read data back** — `get_wave` returns an existing wave's full data and
   metadata (any dimensionality, numeric/complex/text/wave-reference).
   `read_session_history` reads back everything sent to Igor's history area.
