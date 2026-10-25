@@ -27,6 +27,10 @@ static Constant    ZBR_ZEROMQ_DEFAULT_PORT = 5680
 static StrConstant ZBR_ZEROMQ_ENV_PORT     = "IGOR_PRO_BRIDGE_PORT"
 
 static StrConstant ZBR_RECOMPILE_WATCHDOG_TASK = "ZBR_RecompileWatchdog"
+static StrConstant ZBR_BIND_KEEPER_TASK        = "ZBR_BindKeeper"
+static Constant    ZBR_BIND_KEEPER_PERIOD      = 600 ///< [ticks], 10 s
+static StrConstant ZBR_REBIND_REQUEST_FOLDER   = "igor-pro-bridge"
+static StrConstant ZBR_REBIND_REQUEST_FILE     = "rebind-request-"
 
 static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
 static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
@@ -592,11 +596,11 @@ Function ZBR_IsCompiled()
 	return strlen(FunctionInfo("ProcGlobal#ZBR_DefinitelyNotARealFunctionName_8f3a1c")) == 0
 End
 
-/// Reads root:gClaudeHelperCompileCounter (bumped by AfterCompiledHook on every
+/// Reads compileCounter of the package folder (bumped by AfterCompiledHook on every
 /// successful compile) without creating it. Returns -1 if not yet created.
 Function ZBR_ReadCompileCounter()
 
-	return NumVarOrDefault("root:gClaudeHelperCompileCounter", -1)
+	return NumVarOrDefault(ZBR_PACKAGEFOLDER + ":compileCounter", -1)
 End
 
 /// Queues ZBR_StopHandlerBeforeRecompile, RELOAD CHANGED PROCS, and COMPILEPROCEDURES as
@@ -623,6 +627,9 @@ Function ZBR_StopHandlerBeforeRecompile()
 
 	variable err
 
+	DFREF      dfr                  = ZBR_GetPackageFolder()
+	variable/G dfr:recompilePending = 1
+
 	zeromq_handler_stop(); err = GetRTError(1)
 	ZBR_ArmRecompileWatchdog()
 
@@ -636,6 +643,7 @@ Function ZBR_StartHandlerAfterRecompile()
 	variable err
 
 	zeromq_handler_start(); err = GetRTError(1)
+	KillVariables/Z $(ZBR_PACKAGEFOLDER + ":recompilePending")
 	Execute/P/Q/Z "AUTOCOMPILE ON "
 
 	// V_flag cleanup for the Execute/Z entries of ZBR_SubmitReloadAndCompile()
@@ -859,25 +867,104 @@ End
 /// (Re-)binds this module's ZeroMQ ROUTER socket and starts its handler. Does not call
 /// zeromq_stop() first, so it won't tear down any other ZeroMQ binds in the same
 /// experiment (e.g. MIES's own). Safe to call repeatedly -- an already-bound error is
-/// caught, not propagated. Called from IgorStartOrNewHook; recompiles instead just
+/// caught, not propagated. Also starts the background task ZBR_BindKeeper, which rebinds
+/// the socket on request of the bridge, see ZBR_BindKeeperTick(). Called from
+/// IgorStartOrNewHook; recompiles instead just
 /// stop/restart the handler via ZBR_StopHandlerBeforeRecompile/
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
 Function ZBR_EnsureZeroMQBound()
 
-	variable err, port
-	string bindURL, envPort
+	variable err
+
+	ZBR_BindSocket()
+
+	CtrlNamedBackground $ZBR_BIND_KEEPER_TASK, period=ZBR_BIND_KEEPER_PERIOD, proc=ZBR_BindKeeperTick, start
+	err = GetRTError(1)
+
+	return 0
+End
+
+/// Background task: Rebind the socket and restart the handler when the bridge requests it,
+/// e.g. after zeromq_stop() of other code, which tears down all ZeroMQ sockets of the
+/// process. Skipped while a reload/compile of the bridge runs, which stops the handler on
+/// purpose.
+///
+/// The ZeroMQ-XOP can not tell silently whether a socket is bound: a bind attempt prints
+/// "Address in use" into the history, and zeromq_handler_start() reports a running
+/// handler also when other code, e.g. MIES, restarted it with only its own binds. So the
+/// bridge, which gets no reply then, writes a request file (see
+/// ZBR_GetRebindRequestFile()) and this task only checks for it.
+Function ZBR_BindKeeperTick(STRUCT WMBackgroundStruct &s)
+
+	string requestFile
+
+	if(NumVarOrDefault(ZBR_PACKAGEFOLDER + ":recompilePending", 0))
+		return 0
+	endif
+
+	requestFile = ZBR_GetRebindRequestFile()
+	if(!strlen(requestFile))
+		return 0
+	endif
+
+	GetFileFolderInfo/Q/Z requestFile
+	if(V_flag || !V_isFile)
+		return 0
+	endif
+
+	DeleteFile/Z requestFile
+	ZBR_BindSocket()
+
+	return 0
+End
+
+/// Path of the file by which the bridge requests a rebind of the socket on our port:
+/// %LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>, "" without LOCALAPPDATA
+static Function/S ZBR_GetRebindRequestFile()
+
+	string localAppData
+
+	localAppData = GetEnvironmentVariable("LOCALAPPDATA")
+	if(!strlen(localAppData))
+		return ""
+	endif
+
+	return ParseFilePath(5, localAppData, ":", 0, 0) + ":" + ZBR_REBIND_REQUEST_FOLDER + ":" + ZBR_REBIND_REQUEST_FILE + num2istr(ZBR_GetPort())
+End
+
+/// Port of our ZeroMQ socket: IGOR_PRO_BRIDGE_PORT or the default port
+///
+/// @param verbose [optional, defaults to false] print a message if IGOR_PRO_BRIDGE_PORT
+///                can not be parsed
+static Function ZBR_GetPort([variable verbose])
+
+	variable port, err
+	string envPort
 
 	envPort = GetEnvironmentVariable(ZBR_ZEROMQ_ENV_PORT)
 	if(!strlen(envPort))
-		port = ZBR_ZEROMQ_DEFAULT_PORT
-	else
-		port = str2num(envPort); err = GetRTError(1)
-		if(numType(port) == 2)
-			printf "Could not parse port number from %s: %s\rUsing default port %d\r", ZBR_ZEROMQ_ENV_PORT, envPort, ZBR_ZEROMQ_DEFAULT_PORT
-			port = ZBR_ZEROMQ_DEFAULT_PORT
-		endif
+		return ZBR_ZEROMQ_DEFAULT_PORT
 	endif
 
+	port = str2num(envPort); err = GetRTError(1)
+	if(numType(port) == 2)
+		if(!ParamIsDefault(verbose) && verbose)
+			printf "Could not parse port number from %s: %s\rUsing default port %d\r", ZBR_ZEROMQ_ENV_PORT, envPort, ZBR_ZEROMQ_DEFAULT_PORT
+		endif
+		return ZBR_ZEROMQ_DEFAULT_PORT
+	endif
+
+	return port
+End
+
+/// Bind the ZeroMQ ROUTER socket of this module and start the handler, see
+/// ZBR_EnsureZeroMQBound()
+static Function ZBR_BindSocket()
+
+	variable err, port
+	string bindURL
+
+	port = ZBR_GetPort(verbose = 1)
 	sprintf bindURL, "%s:%d", ZBR_ZEROMQ_ENDPOINT, port
 	zeromq_server_bind(bindURL); err = GetRTError(1)
 	if(!err)
@@ -925,10 +1012,11 @@ static Function AfterCompiledHook()
 	ExperimentModified
 	modifiedBefore = V_flag
 
-	variable/G root:gClaudeHelperCompileCounter
-	NVAR gClaudeHelperCompileCounter = root:gClaudeHelperCompileCounter
+	DFREF dfr = ZBR_GetPackageFolder()
+	variable/G dfr:compileCounter
+	NVAR compileCounter = dfr:compileCounter
 
-	gClaudeHelperCompileCounter += 1
+	compileCounter += 1
 
 	if(!modifiedBefore)
 		ExperimentModified 0

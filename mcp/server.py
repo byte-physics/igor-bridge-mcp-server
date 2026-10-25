@@ -416,8 +416,39 @@ def call_function(name, params=None, timeout_ms=_ZMQ_DEFAULT_RECV_TIMEOUT_MS):
     return _decode_typed(result)
 
 
+_REBIND_KEEPER_PERIOD_SECONDS = 10
+
+
+def _rebind_request_file():
+    """File by which the bridge asks Igor Pro to rebind its socket, see ZBR_BindKeeperTick in
+    ZMQ_BridgeHelpers.ipf: %LOCALAPPDATA%\\igor-pro-bridge\\rebind-request-<port>."""
+    port = _igor_zmq_endpoint().rsplit(":", 1)[1]
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "igor-pro-bridge", f"rebind-request-{port}"
+    )
+
+
+def _request_rebind() -> bool:
+    """Ask Igor Pro to rebind the socket of this bridge, e.g. after zeromq_stop() of other
+    code. Its background task ZBR_BindKeeper checks for the request file every
+    _REBIND_KEEPER_PERIOD_SECONDS while no procedure code runs. A request while Igor Pro is
+    only busy is harmless: the bind attempt then just fails with \"Address in use\"."""
+    if not os.environ.get("LOCALAPPDATA"):
+        return False
+    path = _rebind_request_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        return False
+    return True
+
+
 def _diagnose_no_reply() -> str:
-    """Short diagnosis why Igor Pro does not answer, from the OS process and window list."""
+    """Short diagnosis why Igor Pro does not answer, from the OS process and window list.
+    Requests a rebind of the socket if Igor Pro runs and shows no dialog, see
+    _request_rebind."""
     try:
         pids = _list_igor_pids()
         if not pids:
@@ -431,11 +462,19 @@ def _diagnose_no_reply() -> str:
             f"Igor Pro is running and shows these windows besides its main window: {titles}. "
             "A modal dialog blocks the bridge -- see list_igor_windows/close_igor_window."
         )
+    rebind = (
+        f"Requested a rebind of the socket at {_igor_zmq_endpoint()} (e.g. after zeromq_stop() "
+        "of other code), which Igor Pro does within "
+        f"{_REBIND_KEEPER_PERIOD_SECONDS} s while no procedure code runs; retry then. "
+        if _request_rebind()
+        else ""
+    )
     return (
         "Igor Pro is running and shows no dialog, so it is probably busy (e.g. a long "
-        "command, saving a large experiment); try again later or with a longer timeout. "
-        "Otherwise ZMQ_BridgeHelpers.ipf may not be loaded or its socket not bound to "
-        f"{_igor_zmq_endpoint()}, see check_bridge_health."
+        "command, saving a large experiment) or its socket is not bound. "
+        + rebind
+        + "Otherwise try again later or with a longer timeout; if it never answers, "
+        "ZMQ_BridgeHelpers.ipf may not be loaded, see check_bridge_health."
     )
 
 
@@ -713,7 +752,7 @@ def reload_and_compile_procedures() -> dict:
     Igor-side (see that function's docstring in ZMQ_BridgeHelpers.ipf), then polls for
     completion using two independent signals, same as the COM-based version did:
 
-    1. root:gClaudeHelperCompileCounter (ZBR_ReadCompileCounter), bumped by
+    1. compileCounter in root:Packages:ZBR (ZBR_ReadCompileCounter), bumped by
        AfterCompiledHook every time Igor confirms a successful compile -- race-free:
        any increase over the baseline read before submitting is trusted immediately.
     2. ZBR_IsCompiled() (the FunctionInfo-based check), as a fallback.
