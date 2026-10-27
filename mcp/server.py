@@ -4,6 +4,10 @@ Igor Pro MCP bridge server
 
 Exposes a running Igor Pro instance to Claude (or any MCP client) as a set of MCP tools.
 
+**v3.1.0**: dialogs are read and answered via UI Automation (`click_igor_dialog_button`),
+`capture_igor_window` returns screenshots, `switch_igor_profile` switches the user files
+folder, and `load_experiment` handles the save question, a silent or an uncompiled Igor Pro.
+
 **v3.0.0**: `run_igor_code` runs code as compiled ProcGlobal functions via the scratch
 procedures in procedure/ZBR_UserProcedures, and commands run in ProcGlobal context once
 those are included; queued commands never open modal dialogs; tools for Igor's windows and
@@ -171,17 +175,20 @@ This is a *local* MCP server (stdio transport) -- it only works from a Claude De
 session running on the same Windows machine as Igor Pro, not from a cloud/Cowork sandbox.
 """
 
+import ctypes
 import hashlib
 import html.parser
 import importlib.metadata
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import zlib
 from typing import Optional
 
 if sys.platform != "win32":
@@ -198,10 +205,13 @@ import win32api
 import win32con
 import win32gui
 import win32process
+import win32ui
+from win32com.shell import shell, shellcon
 
+import comtypes.client
 import zmq
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 mcp = FastMCP("igor-pro")
 
@@ -463,10 +473,10 @@ def _diagnose_no_reply() -> str:
     except Exception:
         return "See check_bridge_health."
     if dialogs:
-        titles = ", ".join(repr(d["title"]) for d in dialogs)
         return (
-            f"Igor Pro is running and shows these windows besides its main window: {titles}. "
-            "A modal dialog blocks the bridge -- see list_igor_windows/close_igor_window."
+            "Igor Pro is running and shows these windows besides its main window: "
+            f"{_describe_dialogs(dialogs)}. A modal dialog blocks the bridge -- see "
+            "list_igor_windows, click_igor_dialog_button and close_igor_window."
         )
     rebind = (
         f"Requested a rebind of the socket at {_igor_zmq_endpoint()} (e.g. after zeromq_stop() "
@@ -1722,7 +1732,7 @@ def edit_help_file(
 # reason as before: the on-disk layout after Claude Desktop installs a .mcpb isn't
 # guaranteed to keep server.py and manifest.json at a fixed relative path, and this
 # needs to be confirmable from inside a conversation independent of that.
-_BRIDGE_VERSION = "3.0.0"
+_BRIDGE_VERSION = "3.1.0"
 
 
 def _installed_package_version(distribution_name: str) -> str | None:
@@ -1825,9 +1835,12 @@ def check_bridge_health() -> dict:
 
 _IGOR_PROCESS_NAME_PREFIX = "igor"
 _KNOWN_STUCK_DIALOG_TITLES = ("Function Compilation Error",)
+_SAVE_EXPERIMENT_QUESTION_REGEXP = re.compile(r"^Do you want to save changes to experiment ")
 _POSTED_KEY_GAP_SECONDS = 0.05
 _POSTED_KEY_SETTLE_SECONDS = 0.2
 _CLOSE_STEP_WAIT_SECONDS = 1.0
+_PW_RENDERFULLCONTENT = 2
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 # "Igor Pro 9.06B01 64-bit" for an untitled experiment, "<experiment> - Igor Pro 9.06B01 64-bit"
 # otherwise; dialogs like "Igor Pro wants to know..." have no version number
 _MAIN_WINDOW_TITLE_REGEXP = re.compile(r"(^|\s-\s)Igor Pro \d+\.\d+")
@@ -1901,27 +1914,6 @@ def _list_igor_pids() -> list:
     return pids
 
 
-def _child_window_texts(hwnd) -> list:
-    """Texts of the native child controls, e.g. the message and the button captions of a
-    standard dialog. Qt windows have no native child controls, so this is empty for them."""
-    texts = []
-
-    def _callback(child, _extra):
-        try:
-            text = win32gui.GetWindowText(child)
-        except Exception:
-            text = ""
-        if text:
-            texts.append(text)
-        return True
-
-    try:
-        win32gui.EnumChildWindows(hwnd, _callback, None)
-    except Exception:
-        pass
-    return texts
-
-
 def _igor_windows(include_hidden: bool = False) -> list:
     windows = []
 
@@ -1945,12 +1937,14 @@ def _igor_windows(include_hidden: bool = False) -> list:
                 "is_main_window": bool(_MAIN_WINDOW_TITLE_REGEXP.search(title)),
                 "process": exe_name,
                 "pid": pid,
-                "child_texts": _child_window_texts(hwnd),
             }
         )
         return True
 
     win32gui.EnumWindows(_callback, None)
+    for window in windows:
+        if window["visible"] and not window["is_main_window"]:
+            window.update(_dialog_contents(window["hwnd"]))
     return windows
 
 
@@ -1958,6 +1952,13 @@ def _possible_dialogs() -> list:
     """Visible top-level Igor windows other than the main window, typically modal dialogs
     when the bridge does not answer."""
     return [w for w in _igor_windows() if not w["is_main_window"] and w["title"]]
+
+
+def _describe_dialogs(dialogs: list) -> str:
+    return ", ".join(
+        f"{d['title']!r} ({' '.join(d['texts'])})" if d.get("texts") else repr(d["title"])
+        for d in dialogs
+    )
 
 
 def _require_igor_window(hwnd: int):
@@ -1980,16 +1981,80 @@ def _window_gone(hwnd: int) -> bool:
     return not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
 
 
+def _wait_until_gone(hwnd: int) -> bool:
+    deadline = time.monotonic() + _CLOSE_STEP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if _window_gone(hwnd):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+_uia_client = None
+_uia_module = None
+
+
+def _uia():
+    """The UI Automation client and the module with its interfaces and constants. Igor's
+    dialogs are Qt windows without native child controls, only UI Automation sees their
+    texts and buttons."""
+    global _uia_client, _uia_module
+    if _uia_client is None:
+        _uia_module = comtypes.client.GetModule("UIAutomationCore.dll")
+        _uia_client = comtypes.client.CreateObject(
+            _uia_module.CUIAutomation, interface=_uia_module.IUIAutomation
+        )
+    return _uia_client, _uia_module
+
+
+def _dialog_elements(hwnd: int) -> list:
+    client, uia = _uia()
+    found = client.ElementFromHandle(hwnd).FindAll(
+        uia.TreeScope_Descendants, client.CreateTrueCondition()
+    )
+    return [found.GetElement(i) for i in range(found.Length)]
+
+
+def _dialog_contents(hwnd: int) -> dict:
+    texts = []
+    buttons = []
+    try:
+        _, uia = _uia()
+        for element in _dialog_elements(hwnd):
+            name = element.CurrentName
+            if not name:
+                continue
+            control_type = element.CurrentControlType
+            if control_type == uia.UIA_TextControlTypeId:
+                texts.append(name)
+            elif control_type == uia.UIA_ButtonControlTypeId:
+                buttons.append(
+                    {
+                        "name": name,
+                        "access_key": element.CurrentAccessKey or "",
+                        "enabled": bool(element.CurrentIsEnabled),
+                    }
+                )
+    except Exception as e:
+        return {"texts": texts, "buttons": buttons, "contents_error": str(e)}
+    return {"texts": texts, "buttons": buttons}
+
+
+def _button_caption(name: str) -> str:
+    return name.replace("&", "").strip().lower()
+
+
 @mcp.tool()
 def list_igor_windows(include_hidden: bool = False) -> dict:
     """List the top-level windows of the running Igor Pro process(es), e.g. to find a modal
     dialog which blocks the bridge.
 
-    Each entry has "hwnd" (for close_igor_window/send_key_to_igor_window), "title",
-    "class_name", "visible", "owner_hwnd" (dialogs are usually owned by the main window),
-    "is_main_window", "process", "pid" and "child_texts" -- the texts of native child
-    controls like the message and button captions of a standard Windows dialog (empty for
-    Igor's Qt windows, use the title then).
+    Each entry has "hwnd" (for click_igor_dialog_button/close_igor_window/
+    send_key_to_igor_window), "title", "class_name", "visible", "owner_hwnd" (dialogs are
+    usually owned by the main window), "is_main_window", "process" and "pid". Visible
+    windows other than the main window also have "texts" (e.g. the message of a dialog) and
+    "buttons" (each with "name", "access_key" and "enabled"), read via UI Automation, so the
+    title and texts tell which dialog it is and how to answer it.
 
     Use this when the bridge does not answer although Igor Pro is running: a modal dialog
     blocks Igor's operation queue and with it the bridge, see check_bridge_health."""
@@ -2006,14 +2071,16 @@ def close_igor_window(hwnd: int, press_enter: bool = False) -> dict:
     confirmation after an error ignores WM_CLOSE but closes on Escape. Closing one dialog
     can open the next one, so call list_igor_windows/check_bridge_health again afterward.
 
-    Dialogs without a Cancel button, e.g. a Yes/No question of DoAlert, ignore both. With
-    `press_enter`, the Enter key is tried last, which **selects the dialog's default
-    button** -- e.g. "Yes", or "Save" in a "save changes?" dialog. Only pass it when that
-    choice is fine, ask the user otherwise.
+    Dialogs without a Cancel button, e.g. a Yes/No question of DoAlert, ignore both; answer
+    them with click_igor_dialog_button. With `press_enter`, the Enter key is tried last,
+    which **selects the dialog's default button** -- e.g. "Yes", or "Save" in a "save
+    changes?" dialog. Only pass it when that choice is fine, ask the user otherwise.
 
-    Returns {"closed": bool, "method": the step which closed it, "title": its title}."""
+    Returns {"closed": bool, "method": the step which closed it, "title": its title,
+    "texts": the texts of the window before closing it}."""
     _require_igor_window(hwnd)
     title = win32gui.GetWindowText(hwnd)
+    texts = _dialog_contents(hwnd)["texts"]
 
     steps = (
         ("WM_CLOSE", lambda: win32api.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)),
@@ -2026,19 +2093,58 @@ def close_igor_window(hwnd: int, press_enter: bool = False) -> dict:
             action()
         except Exception:
             pass
-        deadline = time.monotonic() + _CLOSE_STEP_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            if _window_gone(hwnd):
-                return {"closed": True, "method": name, "title": title}
-            time.sleep(0.1)
+        if _wait_until_gone(hwnd):
+            return {"closed": True, "method": name, "title": title, "texts": texts}
 
-    result = {"closed": False, "method": None, "title": title}
+    result = {"closed": False, "method": None, "title": title, "texts": texts}
     if not press_enter:
         result["note"] = (
             "Neither WM_CLOSE nor Escape closed it, the dialog probably has no Cancel "
-            "button. press_enter=True selects its default button."
+            "button. Answer it with click_igor_dialog_button."
         )
     return result
+
+
+@mcp.tool()
+def click_igor_dialog_button(hwnd: int, button: str) -> dict:
+    """Click a button of an Igor Pro dialog by its caption (case-insensitive), without
+    changing the OS focus, e.g. "No" in the "Do you want to save changes to experiment
+    ...?" dialog, which neither close_igor_window nor a key press can select.
+
+    Decide on the button from the dialog's "title", "texts" and "buttons" of
+    list_igor_windows. Only click a button whose consequence is clear, ask the user
+    otherwise. Answering one dialog can open the next one.
+
+    Returns {"clicked": True, "button": its caption, "title", "texts": the texts of the
+    dialog, "closed": bool}. Raises if the dialog has no enabled button with that caption."""
+    _require_igor_window(hwnd)
+    title = win32gui.GetWindowText(hwnd)
+    contents = _dialog_contents(hwnd)
+    _, uia = _uia()
+    wanted = _button_caption(button)
+    for element in _dialog_elements(hwnd):
+        if (
+            element.CurrentControlType == uia.UIA_ButtonControlTypeId
+            and _button_caption(element.CurrentName or "") == wanted
+            and element.CurrentIsEnabled
+        ):
+            break
+    else:
+        raise RuntimeError(
+            f"Dialog {title!r} has no enabled button {button!r}, its buttons: "
+            f"{contents['buttons']}."
+        )
+
+    caption = element.CurrentName
+    pattern = element.GetCurrentPattern(uia.UIA_InvokePatternId)
+    pattern.QueryInterface(uia.IUIAutomationInvokePattern).Invoke()
+    return {
+        "clicked": True,
+        "button": caption,
+        "title": title,
+        "texts": contents["texts"],
+        "closed": _wait_until_gone(hwnd),
+    }
 
 
 @mcp.tool()
@@ -2059,6 +2165,87 @@ def send_key_to_igor_window(hwnd: int, key: str) -> dict:
 
     _post_key(hwnd, virtual_key)
     return {"sent": True, "key": key, "window_still_open": not _window_gone(hwnd)}
+
+
+def _discard_save_experiment_dialogs(pids: list) -> list:
+    """Answer the "Do you want to save changes to experiment ...?" dialogs of the given
+    processes with "No" and return their texts."""
+    discarded = []
+    for window in _possible_dialogs():
+        if window["pid"] in pids and any(
+            _SAVE_EXPERIMENT_QUESTION_REGEXP.match(text) for text in window.get("texts", [])
+        ):
+            click_igor_dialog_button(window["hwnd"], "No")
+            discarded.append(window["texts"])
+    return discarded
+
+
+def _png(width: int, height: int, bgra: bytes) -> bytes:
+    rgb = bytearray(width * height * 3)
+    rgb[0::3] = bgra[2::4]
+    rgb[1::3] = bgra[1::4]
+    rgb[2::3] = bgra[0::4]
+    stride = width * 3
+    rows = b"".join(b"\x00" + rgb[row * stride : (row + 1) * stride] for row in range(height))
+
+    def _chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = struct.pack(">I", zlib.crc32(kind + data))
+        return struct.pack(">I", len(data)) + kind + data + checksum
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(rows, 6))
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _capture_window(hwnd: int) -> bytes:
+    """PNG of the window. PrintWindow with PW_RENDERFULLCONTENT also renders covered Qt
+    windows. Per-monitor DPI awareness makes the window rectangle match its real pixels."""
+    user32 = ctypes.windll.user32
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    previous = user32.SetThreadDpiAwarenessContext(
+        ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    )
+    window_dc = source = memory = bitmap = None
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        width, height = right - left, bottom - top
+        window_dc = win32gui.GetWindowDC(hwnd)
+        source = win32ui.CreateDCFromHandle(window_dc)
+        memory = source.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(source, width, height)
+        memory.SelectObject(bitmap)
+        if not user32.PrintWindow(hwnd, memory.GetSafeHdc(), _PW_RENDERFULLCONTENT):
+            raise RuntimeError(f"PrintWindow failed for window {hwnd}.")
+        bgra = bitmap.GetBitmapBits(True)
+    finally:
+        if bitmap is not None:
+            win32gui.DeleteObject(bitmap.GetHandle())
+        if memory is not None:
+            memory.DeleteDC()
+        if source is not None:
+            source.DeleteDC()
+        if window_dc is not None:
+            win32gui.ReleaseDC(hwnd, window_dc)
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(previous))
+    if len(bgra) != width * height * 4:
+        raise RuntimeError(f"Unexpected bitmap format of window {hwnd}.")
+    return _png(width, height, bgra)
+
+
+@mcp.tool()
+def capture_igor_window(hwnd: int) -> Image:
+    """Screenshot of a window of Igor Pro as PNG, also if it is covered by other windows,
+    without changing the OS focus.
+
+    Use it to identify an unknown dialog, and to read what list_igor_windows does not
+    report: Qt hides some controls from UI Automation, e.g. the input fields with the values
+    in the control properties dialogs ("Button Control" etc.)."""
+    _require_igor_window(hwnd)
+    return Image(data=_capture_window(hwnd), format="png")
 
 
 def _attempt_dismiss_compile_error_dialog() -> dict:
@@ -2087,6 +2274,8 @@ def _attempt_dismiss_compile_error_dialog() -> dict:
 _IGOR_PRO_BRIDGE_PORT_ENV_VAR = "IGOR_PRO_BRIDGE_PORT"
 
 _configured_igor_exe_path = None
+# Igor Pro major version (as string) -> name of the profile switch_igor_profile activated
+_active_profiles = {}
 
 _CONFIG_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "igor-pro-bridge", "config.json"
@@ -2096,17 +2285,27 @@ _CONFIG_FILE = os.path.join(
 def _save_launch_config():
     os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"exe_path": _configured_igor_exe_path, "port": _configured_igor_port}, f)
+        json.dump(
+            {
+                "exe_path": _configured_igor_exe_path,
+                "port": _configured_igor_port,
+                "active_profiles": _active_profiles,
+            },
+            f,
+        )
 
 
 def _load_launch_config():
     """Restore the settings of configure_igor_launch from a previous bridge process."""
-    global _configured_igor_exe_path, _configured_igor_port
+    global _configured_igor_exe_path, _configured_igor_port, _active_profiles
     try:
         with open(_CONFIG_FILE, encoding="utf-8") as f:
             config = json.load(f)
     except (OSError, ValueError):
         return
+    profiles = config.get("active_profiles")
+    if isinstance(profiles, dict):
+        _active_profiles = {str(k): v for k, v in profiles.items() if isinstance(v, str)}
     exe_path = config.get("exe_path")
     if exe_path and os.path.isfile(exe_path):
         _configured_igor_exe_path = exe_path
@@ -2320,6 +2519,70 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
     }
 
 
+def _quit_igor(process_exit_timeout_seconds: float, consequence: str) -> list:
+    """Quit Igor Pro with `Quit/N` and wait until its process is gone, see load_experiment.
+    Returns the texts of the answered "save changes to experiment?" questions. Raises with
+    `consequence` and the open dialogs if the process does not exit in time."""
+    igor_basename_lower = os.path.basename(_configured_igor_exe_path).lower()
+
+    def _submit_quit() -> bool:
+        try:
+            call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
+            return True
+        except (IgorZmqError, IgorZmqUnreachable):
+            return False
+
+    quit_deadline = time.monotonic() + process_exit_timeout_seconds
+    discarded_save_dialogs = []
+    remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+
+    # Igor Pro compiles uncompiled procedures before it runs a queued command and reports
+    # a compile error as error of the command ("Error in Execute: Quit/N"); Igor Pro 9 can
+    # also get stuck compiling again and again
+    try:
+        compiled = not remaining_pids or bool(call_function("ZBR#ZBR_IsCompiled"))
+    except (IgorZmqError, IgorZmqUnreachable):
+        compiled = True
+    if not compiled:
+        raise RuntimeError(
+            "The procedures of Igor Pro are not compiled, so Quit/N would fail with their "
+            f"compile error. {consequence} Fix the compile error (see "
+            "reload_and_compile_procedures) or ask the user to quit Igor Pro."
+        )
+
+    # A running Igor Pro may not answer, e.g. after zeromq_stop() of a test run. The failed
+    # call requests a rebind, see _request_rebind, so Quit/N is sent again until it arrives.
+    quit_sent = bool(remaining_pids) and _submit_quit()
+    while remaining_pids and time.monotonic() < quit_deadline:
+        if not quit_sent:
+            quit_sent = _submit_quit()
+        discarded_save_dialogs += _discard_save_experiment_dialogs(remaining_pids)
+        time.sleep(0.5)
+        remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+
+    if remaining_pids:
+        dialogs = [d for d in _possible_dialogs() if d["pid"] in remaining_pids]
+        if dialogs:
+            hint = (
+                f"It shows these dialogs: {_describe_dialogs(dialogs)}, answer them with "
+                "click_igor_dialog_button or ask the user."
+            )
+        elif not quit_sent:
+            hint = (
+                "Quit/N could not be sent, Igor Pro did not answer. Check it with "
+                "check_bridge_health or ask the user to quit it."
+            )
+        else:
+            hint = "It shows no dialog, retry with a longer process_exit_timeout_seconds."
+        raise RuntimeError(
+            f"'{igor_basename_lower}' did not fully exit within "
+            f"{process_exit_timeout_seconds:.0f}s (PIDs still running: {remaining_pids}). "
+            f"{consequence} {hint}"
+        )
+
+    return discarded_save_dialogs
+
+
 @mcp.tool()
 def load_experiment(
     file_path: str,
@@ -2364,9 +2627,10 @@ def load_experiment(
     process_exit_timeout_seconds, before ever invoking the relaunch command line. If
     that timeout elapses with the process still present, this raises rather than
     proceeding -- proceeding anyway would just reproduce the same silent-failure risk
-    this check exists to prevent. A stuck "save changes?" dialog on the OLD instance
-    (e.g. if something modified the experiment after your last save) is the most
-    likely cause; check for one by hand if this happens.
+    this check exists to prevent. A "Do you want to save changes to experiment ...?"
+    dialog of the OLD instance is answered with "No" while waiting, as `Quit/N` intends,
+    and listed in "discarded_save_dialogs". Other dialogs, e.g. for unsaved procedure
+    files, are left open and make this raise with their titles and texts.
 
     This is a genuine process restart, not an in-place swap. **Any unsaved changes in
     the currently-open experiment are lost** -- call
@@ -2396,29 +2660,10 @@ def load_experiment(
     if not os.path.isfile(normalized):
         raise RuntimeError(f"'{normalized}' does not exist or is not a file.")
 
-    igor_basename_lower = os.path.basename(_configured_igor_exe_path).lower()
-
-    try:
-        call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
-    except (IgorZmqError, IgorZmqUnreachable):
-        pass  # nothing was running/reachable to begin with -- nothing to quit
-
-    quit_deadline = time.monotonic() + process_exit_timeout_seconds
-    remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
-    while remaining_pids and time.monotonic() < quit_deadline:
-        time.sleep(0.5)
-        remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
-
-    if remaining_pids:
-        raise RuntimeError(
-            f"'{igor_basename_lower}' did not fully exit within "
-            f"{process_exit_timeout_seconds:.0f}s of sending Quit/N (PIDs still "
-            f"running: {remaining_pids}). Relaunching now would risk silently doing "
-            "nothing (see this tool's own docstring) -- check whether the existing "
-            "Igor Pro instance is stuck on an unhandled dialog (e.g. 'save changes?' "
-            "if something modified the experiment since your last save) and resolve "
-            "it by hand, or retry with a longer process_exit_timeout_seconds."
-        )
+    discarded_save_dialogs = _quit_igor(
+        process_exit_timeout_seconds,
+        "Relaunching now would risk silently doing nothing (see this tool's own docstring).",
+    )
 
     try:
         subprocess.Popen(
@@ -2439,6 +2684,7 @@ def load_experiment(
                 "loaded_file": normalized,
                 "zmq_ready": True,
                 "poll_attempts": attempts,
+                "discarded_save_dialogs": discarded_save_dialogs,
             }
         time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
 
@@ -2446,6 +2692,7 @@ def load_experiment(
         "loaded_file": normalized,
         "zmq_ready": False,
         "poll_attempts": attempts,
+        "discarded_save_dialogs": discarded_save_dialogs,
         "possible_dialogs": _possible_dialogs(),
         "note": (
             f"Process relaunched with {normalized!r}, but nothing answered "
@@ -2454,6 +2701,112 @@ def load_experiment(
             "check_bridge_health() again after waiting longer."
         ),
     }
+
+
+_PROFILE_FOLDER_SEPARATOR = "_"
+
+
+def _igor_major_version(exe_path: str) -> int:
+    info = win32api.GetFileVersionInfo(exe_path, "\\")
+    return info["FileVersionMS"] >> 16
+
+
+def _wavemetrics_documents_folder() -> str:
+    return os.path.join(shell.SHGetFolderPath(0, shellcon.CSIDL_PERSONAL, None, 0), "WaveMetrics")
+
+
+def _list_profiles(folder: str, active_name: str) -> list:
+    prefix = active_name + _PROFILE_FOLDER_SEPARATOR
+    return sorted(
+        entry[len(prefix) :]
+        for entry in os.listdir(folder)
+        if entry.startswith(prefix) and os.path.isdir(os.path.join(folder, entry))
+    )
+
+
+@mcp.tool()
+def switch_igor_profile(
+    profile: str,
+    current_profile: str = "",
+    launch: bool = True,
+    process_exit_timeout_seconds: float = 30.0,
+    wait_for_ready_seconds: float = 30.0,
+) -> dict:
+    """Switch the Igor Pro profile, i.e. the user files folder with its procedures, XOPs and
+    settings, then relaunch Igor Pro.
+
+    The profiles are folders in Documents\\WaveMetrics: the active one is
+    "Igor Pro <N> User Files", the others are "Igor Pro <N> User Files_<profile>" (N is
+    the major version of the configured executable). Switching renames the active folder
+    to "..._<current_profile>" and the folder of `profile` to the active name.
+
+    The active folder does not carry its own name, so `current_profile` is required unless
+    this tool activated it before (remembered in the bridge's config.json). Without it, the
+    error lists the available profiles -- ask the user which one is active.
+
+    Quits Igor Pro first like load_experiment (`Quit/N`, a "save changes to experiment?"
+    question is answered with "No", unsaved changes are lost), as Igor Pro uses the
+    folder while it runs. With `launch`, starts Igor Pro again like
+    launch_igor_pro_unattended.
+
+    Returns {"previous_profile", "active_profile", "discarded_save_dialogs"} and, with
+    `launch`, "launch" with the result of launch_igor_pro_unattended."""
+    global _active_profiles
+    if not _resolve_igor_exe_path():
+        raise RuntimeError(
+            "No Igor Pro executable path configured yet and no Igor Pro process is "
+            "running -- call configure_igor_launch(exe_path) first."
+        )
+
+    version = str(_igor_major_version(_configured_igor_exe_path))
+    folder = _wavemetrics_documents_folder()
+    active_name = f"Igor Pro {version} User Files"
+    active_path = os.path.join(folder, active_name)
+    available = _list_profiles(folder, active_name)
+
+    current = current_profile or _active_profiles.get(version, "")
+    if not current:
+        raise RuntimeError(
+            f"Unknown name of the active profile '{active_path}'. Pass current_profile; "
+            f"the inactive profiles are {available}."
+        )
+    if current == profile:
+        raise RuntimeError(f"The profile {profile!r} is already active.")
+
+    target_path = active_path + _PROFILE_FOLDER_SEPARATOR + profile
+    parked_path = active_path + _PROFILE_FOLDER_SEPARATOR + current
+    if not os.path.isdir(target_path):
+        raise RuntimeError(f"No profile {profile!r}, the inactive profiles are {available}.")
+    if not os.path.isdir(active_path):
+        raise RuntimeError(f"The active profile folder '{active_path}' does not exist.")
+    if os.path.exists(parked_path):
+        raise RuntimeError(
+            f"'{parked_path}' already exists, so the active profile can not be renamed to "
+            f"it. Is {current!r} really the active profile?"
+        )
+
+    discarded_save_dialogs = _quit_igor(
+        process_exit_timeout_seconds, "The profile folders were not renamed."
+    )
+
+    os.rename(active_path, parked_path)
+    try:
+        os.rename(target_path, active_path)
+    except OSError:
+        os.rename(parked_path, active_path)
+        raise
+
+    _active_profiles[version] = profile
+    _save_launch_config()
+
+    result = {
+        "previous_profile": current,
+        "active_profile": profile,
+        "discarded_save_dialogs": discarded_save_dialogs,
+    }
+    if launch:
+        result["launch"] = launch_igor_pro_unattended(wait_for_ready_seconds)
+    return result
 
 
 if __name__ == "__main__":

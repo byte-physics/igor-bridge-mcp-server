@@ -254,13 +254,15 @@ import mcp
 import zmq
 import win32api
 import win32gui
+import comtypes.client
 
 print(f"python_executable: {sys.executable}")
 print(f"python_version: {sys.version.split()[0]}")
 print(f"mcp_package_version: {importlib.metadata.version('mcp')}")
 print(f"pyzmq_version: {importlib.metadata.version('pyzmq')}")
 print(f"pywin32_build: {importlib.metadata.version('pywin32')}")
-print("zmq / win32api / win32gui imports OK")
+print(f"comtypes_version: {importlib.metadata.version('comtypes')}")
+print("zmq / win32api / win32gui / comtypes imports OK")
 '@
 $verifyScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) "igor-bridge-verify-$([guid]::NewGuid()).py"
 try {

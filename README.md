@@ -30,10 +30,14 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   `reload_and_compile_procedures` check and refresh Igor's compiled state
   after editing a `.ipf` file on disk.
 - **Windows and dialogs** — `list_igor_windows` lists Igor's top-level windows,
-  e.g. a modal dialog blocking the bridge; `close_igor_window` closes one
-  (WM_CLOSE, Escape, and only on request Enter, which selects the default
-  button) and `send_key_to_igor_window` sends a key, both without needing OS
-  focus. `check_bridge_health` reports such dialogs.
+  e.g. a modal dialog blocking the bridge, with the texts and buttons of each
+  dialog; `click_igor_dialog_button` clicks a button by its caption,
+  `close_igor_window` closes a dialog (WM_CLOSE, Escape, and only on request
+  Enter, which selects the default button), `send_key_to_igor_window` sends a
+  key and `capture_igor_window` returns a screenshot of a window, e.g. of an
+  unknown dialog, all without needing OS focus. `check_bridge_health` reports such dialogs,
+  and `load_experiment` answers the old instance's "save changes to experiment?"
+  question with "No".
 - **Debugger control** — `get_debugger_state` / `set_debugger_enabled` /
   `restore_debugger_settings` read, change, and restore Igor's Debugger
   settings (must be disabled for unattended/automated use).
@@ -48,7 +52,10 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   talking to more than one Igor Pro instance, one at a time);
   `launch_igor_pro_unattended` launches it with `/UNATTENDED` and waits for it
   to become reachable; `load_experiment` quits the running instance and
-  relaunches it with a `.pxp` file path as a launch argument.
+  relaunches it with a `.pxp` file path as a launch argument;
+  `switch_igor_profile` quits Igor Pro, activates another profile (user files
+  folder `Igor Pro <N> User Files_<profile>` in `Documents\WaveMetrics`) by
+  renaming the folders, and relaunches it.
 - **Health check** — `check_bridge_health` diagnoses whether this bridge can
   reach Igor Pro's ZeroMQ server right now.
 
@@ -143,6 +150,6 @@ If you put ipt in your working folder or PATH then Claude can call it to generat
   compiled into the target experiment.
 - Python (accessible as `python` on PATH), with the pinned packages in
   `requirements.txt` installed into that same environment — `mcp`, `pyzmq`,
-  and (on Windows) `pywin32`. `requirements.txt` pins every package, direct
+  and (on Windows) `pywin32` and `comtypes`. `requirements.txt` pins every package, direct
   and transitive, with hashes for supply-chain integrity; install with
   `install.ps1` rather than a plain `pip install`.

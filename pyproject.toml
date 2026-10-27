@@ -1,10 +1,11 @@
 [project]
 name = "igor-pro-bridge"
-version = "3.0.0"
+version = "3.1.0"
 description = "MCP bridge for controlling Igor Pro via its ZeroMQ-XOP CallFunction interface"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.29.0,<2",
     "pyzmq==27.1.0",
     "pywin32==312; sys_platform == 'win32'",
+    "comtypes==1.4.17; sys_platform == 'win32'",
 ]

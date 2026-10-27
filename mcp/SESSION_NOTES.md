@@ -304,7 +304,8 @@ suppress the popup the way it does for an ordinary runtime error. This would han
 unattended use exactly like the stale-refnum and out-of-range-write bugs above. **General
 rule: never use `Abort "<message>"` for an expected/recoverable failure path in any code
 this bridge might run unattended -- set an error status value directly instead**, since
-there is no scriptable way to dismiss the resulting dialog.
+the resulting dialog blocks the bridge until it is clicked away from outside Igor
+(`click_igor_dialog_button`).
 
 ### `ZBR_ProcedureText`: window name is the THIRD argument
 
@@ -458,3 +459,37 @@ follow-up calls instead of re-declaring.
   `StartZeroMQSockets(forceRestart = 1)` called `zeromq_stop()` and restarted the handler with
   only its own binds. The background task `ZBR_BindKeeper` therefore only rebinds when the
   bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.
+
+## Igor Pro profiles
+
+- A profile is a user files folder in `Documents\WaveMetrics`: Igor Pro uses
+  `Igor Pro <N> User Files` (its procedures, XOPs, help files and settings), the inactive
+  ones are named `Igor Pro <N> User Files_<profile>`. Switching renames the folders while
+  Igor Pro is not running (user's established workflow, preferred over changing a profile).
+- The active folder does not carry its name, so `switch_igor_profile` remembers the profile
+  it activated per major version in `%APPDATA%\igor-pro-bridge\config.json` and otherwise
+  needs `current_profile`.
+
+## Dialogs: reading and answering them via UI Automation
+
+- Igor's dialogs are Qt windows (class `Qt5QWindow`) without native child controls, so
+  `EnumChildWindows`/`GetWindowText` only see their title. UI Automation (`comtypes`,
+  `UIAutomationCore.dll`) sees everything: the message as Text elements (AutomationIds like
+  `IgorMDIMain.StdAlert._alertTextLabel`/`_detailedTextLabel`, `IgorMDIMain.DoAlertDialog.*`,
+  `IgorMDIMain.ErrorDialog.errorMessageLabel`) and the buttons with their access keys
+  ("Enter" marks the default button). Verified 2026-10-27 with Igor Pro 9.06B01.
+- Not every control is exposed: the control properties dialogs ("Button Control" etc.) put
+  their input fields into the value column of a tree view as index widgets, which Qt hides
+  from UI Automation. The value cells stay empty via the Value, LegacyIAccessible and Grid
+  patterns, invoking a cell opens no editor, and `ElementFromPoint` on a field returns the
+  empty cell. Only the property names, the buttons and the generated command are readable.
+  `capture_igor_window` (PrintWindow with PW_RENDERFULLCONTENT, also for covered windows)
+  shows the values; such dialogs cannot be filled in, use the matching command instead.
+- A button's InvokePattern clicks it without OS focus and works for every button. Keys
+  posted to the window cannot select "No": a Yes/No `DoAlert` ignores WM_CLOSE and Escape,
+  and Enter selects "Yes". Invoking "No" made `DoAlert` return `V_flag` 2.
+- Switching experiments: a queued `LOADFILE <path>` on a modified experiment asks "Do you
+  want to save changes to experiment "<name>"?" (Yes/No/Cancel, the second text lists the
+  changes), while a queued `NEWEXPERIMENT` discards the changes without asking.
+  `load_experiment` answers only this experiment question with "No" (that is what `Quit/N`
+  intends); questions about unsaved procedure files are left to the user.
