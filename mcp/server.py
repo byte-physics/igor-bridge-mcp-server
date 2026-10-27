@@ -2521,31 +2521,44 @@ def _quit_igor(process_exit_timeout_seconds: float, consequence: str) -> list:
     `consequence` and the open dialogs if the process does not exit in time."""
     igor_basename_lower = os.path.basename(_configured_igor_exe_path).lower()
 
-    try:
-        call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
-    except (IgorZmqError, IgorZmqUnreachable):
-        pass  # nothing was running/reachable to begin with -- nothing to quit
+    def _submit_quit() -> bool:
+        try:
+            call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
+            return True
+        except (IgorZmqError, IgorZmqUnreachable):
+            return False
 
     quit_deadline = time.monotonic() + process_exit_timeout_seconds
     discarded_save_dialogs = []
     remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+    # A running Igor Pro may not answer, e.g. after zeromq_stop() of a test run. The failed
+    # call requests a rebind, see _request_rebind, so Quit/N is sent again until it arrives.
+    quit_sent = bool(remaining_pids) and _submit_quit()
     while remaining_pids and time.monotonic() < quit_deadline:
+        if not quit_sent:
+            quit_sent = _submit_quit()
         discarded_save_dialogs += _discard_save_experiment_dialogs(remaining_pids)
         time.sleep(0.5)
         remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
 
     if remaining_pids:
         dialogs = [d for d in _possible_dialogs() if d["pid"] in remaining_pids]
-        raise RuntimeError(
-            f"'{igor_basename_lower}' did not fully exit within "
-            f"{process_exit_timeout_seconds:.0f}s of sending Quit/N (PIDs still "
-            f"running: {remaining_pids}). {consequence} "
-            + (
+        if dialogs:
+            hint = (
                 f"It shows these dialogs: {_describe_dialogs(dialogs)}, answer them with "
                 "click_igor_dialog_button or ask the user."
-                if dialogs
-                else "It shows no dialog, retry with a longer process_exit_timeout_seconds."
             )
+        elif not quit_sent:
+            hint = (
+                "Quit/N could not be sent, Igor Pro did not answer. Check it with "
+                "check_bridge_health or ask the user to quit it."
+            )
+        else:
+            hint = "It shows no dialog, retry with a longer process_exit_timeout_seconds."
+        raise RuntimeError(
+            f"'{igor_basename_lower}' did not fully exit within "
+            f"{process_exit_timeout_seconds:.0f}s (PIDs still running: {remaining_pids}). "
+            f"{consequence} {hint}"
         )
 
     return discarded_save_dialogs
