@@ -887,9 +887,19 @@ End
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
 Function ZBR_EnsureZeroMQBound()
 
-	variable err
-
 	ZBR_BindSocket()
+	ZBR_StartBindKeeper()
+
+	return 0
+End
+
+/// Start the background task ZBR_BindKeeper, see ZBR_BindKeeperTick()
+///
+/// Opening an experiment stops the task and drops its function, but keeps our socket
+/// bound, so AfterCompiledHook starts it again.
+static Function ZBR_StartBindKeeper()
+
+	variable err
 
 	CtrlNamedBackground $ZBR_BIND_KEEPER_TASK, period=ZBR_BIND_KEEPER_PERIOD, proc=ZBR_BindKeeperTick, start
 	err = GetRTError(1)
@@ -1016,8 +1026,9 @@ static Function IgorStartOrNewHook(string igorApplicationNameStr)
 	return 0
 End
 
-/// Bumps the compile-confirmation counter on every successful compile. Does not touch
-/// the ZeroMQ socket/handler -- see IgorStartOrNewHook.
+/// Bumps the compile-confirmation counter on every successful compile and starts the
+/// background task ZBR_BindKeeper, see ZBR_StartBindKeeper(). Does not touch the ZeroMQ
+/// socket/handler -- see IgorStartOrNewHook.
 static Function AfterCompiledHook()
 
 	variable modifiedBefore
@@ -1030,6 +1041,8 @@ static Function AfterCompiledHook()
 	NVAR compileCounter = dfr:compileCounter
 
 	compileCounter += 1
+
+	ZBR_StartBindKeeper()
 
 	if(!modifiedBefore)
 		ExperimentModified 0
