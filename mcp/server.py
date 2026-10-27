@@ -2531,6 +2531,21 @@ def _quit_igor(process_exit_timeout_seconds: float, consequence: str) -> list:
     quit_deadline = time.monotonic() + process_exit_timeout_seconds
     discarded_save_dialogs = []
     remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+
+    # Igor Pro compiles uncompiled procedures before it runs a queued command and reports
+    # a compile error as error of the command ("Error in Execute: Quit/N"); Igor Pro 9 can
+    # also get stuck compiling again and again
+    try:
+        compiled = not remaining_pids or bool(call_function("ZBR#ZBR_IsCompiled"))
+    except (IgorZmqError, IgorZmqUnreachable):
+        compiled = True
+    if not compiled:
+        raise RuntimeError(
+            "The procedures of Igor Pro are not compiled, so Quit/N would fail with their "
+            f"compile error. {consequence} Fix the compile error (see "
+            "reload_and_compile_procedures) or ask the user to quit Igor Pro."
+        )
+
     # A running Igor Pro may not answer, e.g. after zeromq_stop() of a test run. The failed
     # call requests a rebind, see _request_rebind, so Quit/N is sent again until it arrives.
     quit_sent = bool(remaining_pids) and _submit_quit()
