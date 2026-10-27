@@ -34,7 +34,9 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   dialog; `click_igor_dialog_button` clicks a button by its caption,
   `close_igor_window` closes a dialog (WM_CLOSE, Escape, and only on request
   Enter, which selects the default button) and `send_key_to_igor_window` sends a
-  key, all without needing OS focus. `check_bridge_health` reports such dialogs.
+  key, all without needing OS focus. `check_bridge_health` reports such dialogs,
+  and `load_experiment` answers the old instance's "save changes to experiment?"
+  question with "No".
 - **Debugger control** — `get_debugger_state` / `set_debugger_enabled` /
   `restore_debugger_settings` read, change, and restore Igor's Debugger
   settings (must be disabled for unattended/automated use).

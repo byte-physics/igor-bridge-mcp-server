@@ -1826,6 +1826,7 @@ def check_bridge_health() -> dict:
 
 _IGOR_PROCESS_NAME_PREFIX = "igor"
 _KNOWN_STUCK_DIALOG_TITLES = ("Function Compilation Error",)
+_SAVE_EXPERIMENT_QUESTION_REGEXP = re.compile(r"^Do you want to save changes to experiment ")
 _POSTED_KEY_GAP_SECONDS = 0.05
 _POSTED_KEY_SETTLE_SECONDS = 0.2
 _CLOSE_STEP_WAIT_SECONDS = 1.0
@@ -2155,6 +2156,19 @@ def send_key_to_igor_window(hwnd: int, key: str) -> dict:
     return {"sent": True, "key": key, "window_still_open": not _window_gone(hwnd)}
 
 
+def _discard_save_experiment_dialogs(pids: list) -> list:
+    """Answer the "Do you want to save changes to experiment ...?" dialogs of the given
+    processes with "No" and return their texts."""
+    discarded = []
+    for window in _possible_dialogs():
+        if window["pid"] in pids and any(
+            _SAVE_EXPERIMENT_QUESTION_REGEXP.match(text) for text in window.get("texts", [])
+        ):
+            click_igor_dialog_button(window["hwnd"], "No")
+            discarded.append(window["texts"])
+    return discarded
+
+
 def _attempt_dismiss_compile_error_dialog() -> dict:
     """Close a "Function Compilation Error" dialog (only shown if Igor Pro was not launched
     with /UNATTENDED), see reload_and_compile_procedures."""
@@ -2458,9 +2472,10 @@ def load_experiment(
     process_exit_timeout_seconds, before ever invoking the relaunch command line. If
     that timeout elapses with the process still present, this raises rather than
     proceeding -- proceeding anyway would just reproduce the same silent-failure risk
-    this check exists to prevent. A stuck "save changes?" dialog on the OLD instance
-    (e.g. if something modified the experiment after your last save) is the most
-    likely cause; check for one by hand if this happens.
+    this check exists to prevent. A "Do you want to save changes to experiment ...?"
+    dialog of the OLD instance is answered with "No" while waiting, as `Quit/N` intends,
+    and listed in "discarded_save_dialogs". Other dialogs, e.g. for unsaved procedure
+    files, are left open and make this raise with their titles and texts.
 
     This is a genuine process restart, not an in-place swap. **Any unsaved changes in
     the currently-open experiment are lost** -- call
@@ -2498,20 +2513,26 @@ def load_experiment(
         pass  # nothing was running/reachable to begin with -- nothing to quit
 
     quit_deadline = time.monotonic() + process_exit_timeout_seconds
+    discarded_save_dialogs = []
     remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
     while remaining_pids and time.monotonic() < quit_deadline:
+        discarded_save_dialogs += _discard_save_experiment_dialogs(remaining_pids)
         time.sleep(0.5)
         remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
 
     if remaining_pids:
+        dialogs = [d for d in _possible_dialogs() if d["pid"] in remaining_pids]
         raise RuntimeError(
             f"'{igor_basename_lower}' did not fully exit within "
             f"{process_exit_timeout_seconds:.0f}s of sending Quit/N (PIDs still "
             f"running: {remaining_pids}). Relaunching now would risk silently doing "
-            "nothing (see this tool's own docstring) -- check whether the existing "
-            "Igor Pro instance is stuck on an unhandled dialog (e.g. 'save changes?' "
-            "if something modified the experiment since your last save) and resolve "
-            "it by hand, or retry with a longer process_exit_timeout_seconds."
+            "nothing (see this tool's own docstring). "
+            + (
+                f"It shows these dialogs: {_describe_dialogs(dialogs)}, answer them with "
+                "click_igor_dialog_button or ask the user."
+                if dialogs
+                else "It shows no dialog, retry with a longer process_exit_timeout_seconds."
+            )
         )
 
     try:
@@ -2533,6 +2554,7 @@ def load_experiment(
                 "loaded_file": normalized,
                 "zmq_ready": True,
                 "poll_attempts": attempts,
+                "discarded_save_dialogs": discarded_save_dialogs,
             }
         time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
 
@@ -2540,6 +2562,7 @@ def load_experiment(
         "loaded_file": normalized,
         "zmq_ready": False,
         "poll_attempts": attempts,
+        "discarded_save_dialogs": discarded_save_dialogs,
         "possible_dialogs": _possible_dialogs(),
         "note": (
             f"Process relaunched with {normalized!r}, but nothing answered "

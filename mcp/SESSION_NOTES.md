@@ -471,3 +471,8 @@ follow-up calls instead of re-declaring.
 - A button's InvokePattern clicks it without OS focus and works for every button. Keys
   posted to the window cannot select "No": a Yes/No `DoAlert` ignores WM_CLOSE and Escape,
   and Enter selects "Yes". Invoking "No" made `DoAlert` return `V_flag` 2.
+- Switching experiments: a queued `LOADFILE <path>` on a modified experiment asks "Do you
+  want to save changes to experiment "<name>"?" (Yes/No/Cancel, the second text lists the
+  changes), while a queued `NEWEXPERIMENT` discards the changes without asking.
+  `load_experiment` answers only this experiment question with "No" (that is what `Quit/N`
+  intends); questions about unsaved procedure files are left to the user.
