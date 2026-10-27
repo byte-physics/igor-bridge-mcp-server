@@ -460,6 +460,16 @@ follow-up calls instead of re-declaring.
   only its own binds. The background task `ZBR_BindKeeper` therefore only rebinds when the
   bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.
 
+## Igor Pro profiles
+
+- A profile is a user files folder in `Documents\WaveMetrics`: Igor Pro uses
+  `Igor Pro <N> User Files` (its procedures, XOPs, help files and settings), the inactive
+  ones are named `Igor Pro <N> User Files_<profile>`. Switching renames the folders while
+  Igor Pro is not running (user's established workflow, preferred over changing a profile).
+- The active folder does not carry its name, so `switch_igor_profile` remembers the profile
+  it activated per major version in `%APPDATA%\igor-pro-bridge\config.json` and otherwise
+  needs `current_profile`.
+
 ## Dialogs: reading and answering them via UI Automation
 
 - Igor's dialogs are Qt windows (class `Qt5QWindow`) without native child controls, so

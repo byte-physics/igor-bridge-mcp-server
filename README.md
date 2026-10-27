@@ -52,7 +52,10 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   talking to more than one Igor Pro instance, one at a time);
   `launch_igor_pro_unattended` launches it with `/UNATTENDED` and waits for it
   to become reachable; `load_experiment` quits the running instance and
-  relaunches it with a `.pxp` file path as a launch argument.
+  relaunches it with a `.pxp` file path as a launch argument;
+  `switch_igor_profile` quits Igor Pro, activates another profile (user files
+  folder `Igor Pro <N> User Files_<profile>` in `Documents\WaveMetrics`) by
+  renaming the folders, and relaunches it.
 - **Health check** — `check_bridge_health` diagnoses whether this bridge can
   reach Igor Pro's ZeroMQ server right now.
 

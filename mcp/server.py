@@ -202,6 +202,7 @@ import win32con
 import win32gui
 import win32process
 import win32ui
+from win32com.shell import shell, shellcon
 
 import comtypes.client
 import zmq
@@ -2269,6 +2270,8 @@ def _attempt_dismiss_compile_error_dialog() -> dict:
 _IGOR_PRO_BRIDGE_PORT_ENV_VAR = "IGOR_PRO_BRIDGE_PORT"
 
 _configured_igor_exe_path = None
+# Igor Pro major version (as string) -> name of the profile switch_igor_profile activated
+_active_profiles = {}
 
 _CONFIG_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "igor-pro-bridge", "config.json"
@@ -2278,17 +2281,27 @@ _CONFIG_FILE = os.path.join(
 def _save_launch_config():
     os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"exe_path": _configured_igor_exe_path, "port": _configured_igor_port}, f)
+        json.dump(
+            {
+                "exe_path": _configured_igor_exe_path,
+                "port": _configured_igor_port,
+                "active_profiles": _active_profiles,
+            },
+            f,
+        )
 
 
 def _load_launch_config():
     """Restore the settings of configure_igor_launch from a previous bridge process."""
-    global _configured_igor_exe_path, _configured_igor_port
+    global _configured_igor_exe_path, _configured_igor_port, _active_profiles
     try:
         with open(_CONFIG_FILE, encoding="utf-8") as f:
             config = json.load(f)
     except (OSError, ValueError):
         return
+    profiles = config.get("active_profiles")
+    if isinstance(profiles, dict):
+        _active_profiles = {str(k): v for k, v in profiles.items() if isinstance(v, str)}
     exe_path = config.get("exe_path")
     if exe_path and os.path.isfile(exe_path):
         _configured_igor_exe_path = exe_path
@@ -2656,6 +2669,112 @@ def load_experiment(
             "check_bridge_health() again after waiting longer."
         ),
     }
+
+
+_PROFILE_FOLDER_SEPARATOR = "_"
+
+
+def _igor_major_version(exe_path: str) -> int:
+    info = win32api.GetFileVersionInfo(exe_path, "\\")
+    return info["FileVersionMS"] >> 16
+
+
+def _wavemetrics_documents_folder() -> str:
+    return os.path.join(shell.SHGetFolderPath(0, shellcon.CSIDL_PERSONAL, None, 0), "WaveMetrics")
+
+
+def _list_profiles(folder: str, active_name: str) -> list:
+    prefix = active_name + _PROFILE_FOLDER_SEPARATOR
+    return sorted(
+        entry[len(prefix) :]
+        for entry in os.listdir(folder)
+        if entry.startswith(prefix) and os.path.isdir(os.path.join(folder, entry))
+    )
+
+
+@mcp.tool()
+def switch_igor_profile(
+    profile: str,
+    current_profile: str = "",
+    launch: bool = True,
+    process_exit_timeout_seconds: float = 30.0,
+    wait_for_ready_seconds: float = 30.0,
+) -> dict:
+    """Switch the Igor Pro profile, i.e. the user files folder with its procedures, XOPs and
+    settings, then relaunch Igor Pro.
+
+    The profiles are folders in Documents\\WaveMetrics: the active one is
+    "Igor Pro <N> User Files", the others are "Igor Pro <N> User Files_<profile>" (N is
+    the major version of the configured executable). Switching renames the active folder
+    to "..._<current_profile>" and the folder of `profile` to the active name.
+
+    The active folder does not carry its own name, so `current_profile` is required unless
+    this tool activated it before (remembered in the bridge's config.json). Without it, the
+    error lists the available profiles -- ask the user which one is active.
+
+    Quits Igor Pro first like load_experiment (`Quit/N`, a "save changes to experiment?"
+    question is answered with "No", unsaved changes are lost), as Igor Pro uses the
+    folder while it runs. With `launch`, starts Igor Pro again like
+    launch_igor_pro_unattended.
+
+    Returns {"previous_profile", "active_profile", "discarded_save_dialogs"} and, with
+    `launch`, "launch" with the result of launch_igor_pro_unattended."""
+    global _active_profiles
+    if not _resolve_igor_exe_path():
+        raise RuntimeError(
+            "No Igor Pro executable path configured yet and no Igor Pro process is "
+            "running -- call configure_igor_launch(exe_path) first."
+        )
+
+    version = str(_igor_major_version(_configured_igor_exe_path))
+    folder = _wavemetrics_documents_folder()
+    active_name = f"Igor Pro {version} User Files"
+    active_path = os.path.join(folder, active_name)
+    available = _list_profiles(folder, active_name)
+
+    current = current_profile or _active_profiles.get(version, "")
+    if not current:
+        raise RuntimeError(
+            f"Unknown name of the active profile '{active_path}'. Pass current_profile; "
+            f"the inactive profiles are {available}."
+        )
+    if current == profile:
+        raise RuntimeError(f"The profile {profile!r} is already active.")
+
+    target_path = active_path + _PROFILE_FOLDER_SEPARATOR + profile
+    parked_path = active_path + _PROFILE_FOLDER_SEPARATOR + current
+    if not os.path.isdir(target_path):
+        raise RuntimeError(f"No profile {profile!r}, the inactive profiles are {available}.")
+    if not os.path.isdir(active_path):
+        raise RuntimeError(f"The active profile folder '{active_path}' does not exist.")
+    if os.path.exists(parked_path):
+        raise RuntimeError(
+            f"'{parked_path}' already exists, so the active profile can not be renamed to "
+            f"it. Is {current!r} really the active profile?"
+        )
+
+    discarded_save_dialogs = _quit_igor(
+        process_exit_timeout_seconds, "The profile folders were not renamed."
+    )
+
+    os.rename(active_path, parked_path)
+    try:
+        os.rename(target_path, active_path)
+    except OSError:
+        os.rename(parked_path, active_path)
+        raise
+
+    _active_profiles[version] = profile
+    _save_launch_config()
+
+    result = {
+        "previous_profile": current,
+        "active_profile": profile,
+        "discarded_save_dialogs": discarded_save_dialogs,
+    }
+    if launch:
+        result["launch"] = launch_igor_pro_unattended(wait_for_ready_seconds)
+    return result
 
 
 if __name__ == "__main__":

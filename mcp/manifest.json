@@ -70,6 +70,10 @@
       "description": "Return an existing Igor wave's full data and metadata (any dimensionality; numeric, complex, text, or wave-reference)."
     },
     {
+      "name": "switch_igor_profile",
+      "description": "Quit Igor Pro, activate another profile (user files folder) by renaming the folders and relaunch it"
+    },
+    {
       "name": "load_experiment",
       "description": "Quit the running Igor Pro instance and relaunch it with a .pxp experiment file path as a launch argument."
     },
