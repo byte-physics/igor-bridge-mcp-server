@@ -171,17 +171,20 @@ This is a *local* MCP server (stdio transport) -- it only works from a Claude De
 session running on the same Windows machine as Igor Pro, not from a cloud/Cowork sandbox.
 """
 
+import ctypes
 import hashlib
 import html.parser
 import importlib.metadata
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+import zlib
 from typing import Optional
 
 if sys.platform != "win32":
@@ -198,11 +201,12 @@ import win32api
 import win32con
 import win32gui
 import win32process
+import win32ui
 
 import comtypes.client
 import zmq
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 mcp = FastMCP("igor-pro")
 
@@ -1830,6 +1834,8 @@ _SAVE_EXPERIMENT_QUESTION_REGEXP = re.compile(r"^Do you want to save changes to 
 _POSTED_KEY_GAP_SECONDS = 0.05
 _POSTED_KEY_SETTLE_SECONDS = 0.2
 _CLOSE_STEP_WAIT_SECONDS = 1.0
+_PW_RENDERFULLCONTENT = 2
+_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 # "Igor Pro 9.06B01 64-bit" for an untitled experiment, "<experiment> - Igor Pro 9.06B01 64-bit"
 # otherwise; dialogs like "Igor Pro wants to know..." have no version number
 _MAIN_WINDOW_TITLE_REGEXP = re.compile(r"(^|\s-\s)Igor Pro \d+\.\d+")
@@ -2167,6 +2173,74 @@ def _discard_save_experiment_dialogs(pids: list) -> list:
             click_igor_dialog_button(window["hwnd"], "No")
             discarded.append(window["texts"])
     return discarded
+
+
+def _png(width: int, height: int, bgra: bytes) -> bytes:
+    rgb = bytearray(width * height * 3)
+    rgb[0::3] = bgra[2::4]
+    rgb[1::3] = bgra[1::4]
+    rgb[2::3] = bgra[0::4]
+    stride = width * 3
+    rows = b"".join(b"\x00" + rgb[row * stride : (row + 1) * stride] for row in range(height))
+
+    def _chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = struct.pack(">I", zlib.crc32(kind + data))
+        return struct.pack(">I", len(data)) + kind + data + checksum
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(rows, 6))
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _capture_window(hwnd: int) -> bytes:
+    """PNG of the window. PrintWindow with PW_RENDERFULLCONTENT also renders covered Qt
+    windows. Per-monitor DPI awareness makes the window rectangle match its real pixels."""
+    user32 = ctypes.windll.user32
+    user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    previous = user32.SetThreadDpiAwarenessContext(
+        ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    )
+    window_dc = source = memory = bitmap = None
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        width, height = right - left, bottom - top
+        window_dc = win32gui.GetWindowDC(hwnd)
+        source = win32ui.CreateDCFromHandle(window_dc)
+        memory = source.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(source, width, height)
+        memory.SelectObject(bitmap)
+        if not user32.PrintWindow(hwnd, memory.GetSafeHdc(), _PW_RENDERFULLCONTENT):
+            raise RuntimeError(f"PrintWindow failed for window {hwnd}.")
+        bgra = bitmap.GetBitmapBits(True)
+    finally:
+        if bitmap is not None:
+            win32gui.DeleteObject(bitmap.GetHandle())
+        if memory is not None:
+            memory.DeleteDC()
+        if source is not None:
+            source.DeleteDC()
+        if window_dc is not None:
+            win32gui.ReleaseDC(hwnd, window_dc)
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(previous))
+    if len(bgra) != width * height * 4:
+        raise RuntimeError(f"Unexpected bitmap format of window {hwnd}.")
+    return _png(width, height, bgra)
+
+
+@mcp.tool()
+def capture_igor_window(hwnd: int) -> Image:
+    """Screenshot of a window of Igor Pro as PNG, also if it is covered by other windows,
+    without changing the OS focus.
+
+    Use it to identify an unknown dialog, and to read what list_igor_windows does not
+    report: Qt hides some controls from UI Automation, e.g. the input fields with the values
+    in the control properties dialogs ("Button Control" etc.)."""
+    _require_igor_window(hwnd)
+    return Image(data=_capture_window(hwnd), format="png")
 
 
 def _attempt_dismiss_compile_error_dialog() -> dict:

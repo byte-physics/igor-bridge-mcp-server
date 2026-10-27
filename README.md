@@ -33,8 +33,9 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   e.g. a modal dialog blocking the bridge, with the texts and buttons of each
   dialog; `click_igor_dialog_button` clicks a button by its caption,
   `close_igor_window` closes a dialog (WM_CLOSE, Escape, and only on request
-  Enter, which selects the default button) and `send_key_to_igor_window` sends a
-  key, all without needing OS focus. `check_bridge_health` reports such dialogs,
+  Enter, which selects the default button), `send_key_to_igor_window` sends a
+  key and `capture_igor_window` returns a screenshot of a window, e.g. of an
+  unknown dialog, all without needing OS focus. `check_bridge_health` reports such dialogs,
   and `load_experiment` answers the old instance's "save changes to experiment?"
   question with "No".
 - **Debugger control** — `get_debugger_state` / `set_debugger_enabled` /

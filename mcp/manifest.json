@@ -98,6 +98,10 @@
       "description": "Click a button of an Igor Pro dialog by its caption, e.g. No in a save changes dialog, without changing the focus"
     },
     {
+      "name": "capture_igor_window",
+      "description": "Screenshot of a window or dialog of Igor Pro, also if it is covered, e.g. to identify an unknown dialog"
+    },
+    {
       "name": "send_key_to_igor_window",
       "description": "Send a key press to a window or dialog of Igor Pro without changing the focus"
     },

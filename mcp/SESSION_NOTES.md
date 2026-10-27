@@ -468,6 +468,13 @@ follow-up calls instead of re-declaring.
   `IgorMDIMain.StdAlert._alertTextLabel`/`_detailedTextLabel`, `IgorMDIMain.DoAlertDialog.*`,
   `IgorMDIMain.ErrorDialog.errorMessageLabel`) and the buttons with their access keys
   ("Enter" marks the default button). Verified 2026-10-27 with Igor Pro 9.06B01.
+- Not every control is exposed: the control properties dialogs ("Button Control" etc.) put
+  their input fields into the value column of a tree view as index widgets, which Qt hides
+  from UI Automation. The value cells stay empty via the Value, LegacyIAccessible and Grid
+  patterns, invoking a cell opens no editor, and `ElementFromPoint` on a field returns the
+  empty cell. Only the property names, the buttons and the generated command are readable.
+  `capture_igor_window` (PrintWindow with PW_RENDERFULLCONTENT, also for covered windows)
+  shows the values; such dialogs cannot be filled in, use the matching command instead.
 - A button's InvokePattern clicks it without OS focus and works for every button. Keys
   posted to the window cannot select "No": a Yes/No `DoAlert` ignores WM_CLOSE and Escape,
   and Enter selects "Yes". Invoking "No" made `DoAlert` return `V_flag` 2.
