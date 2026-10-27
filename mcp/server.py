@@ -2502,6 +2502,42 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
     }
 
 
+def _quit_igor(process_exit_timeout_seconds: float, consequence: str) -> list:
+    """Quit Igor Pro with `Quit/N` and wait until its process is gone, see load_experiment.
+    Returns the texts of the answered "save changes to experiment?" questions. Raises with
+    `consequence` and the open dialogs if the process does not exit in time."""
+    igor_basename_lower = os.path.basename(_configured_igor_exe_path).lower()
+
+    try:
+        call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
+    except (IgorZmqError, IgorZmqUnreachable):
+        pass  # nothing was running/reachable to begin with -- nothing to quit
+
+    quit_deadline = time.monotonic() + process_exit_timeout_seconds
+    discarded_save_dialogs = []
+    remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+    while remaining_pids and time.monotonic() < quit_deadline:
+        discarded_save_dialogs += _discard_save_experiment_dialogs(remaining_pids)
+        time.sleep(0.5)
+        remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
+
+    if remaining_pids:
+        dialogs = [d for d in _possible_dialogs() if d["pid"] in remaining_pids]
+        raise RuntimeError(
+            f"'{igor_basename_lower}' did not fully exit within "
+            f"{process_exit_timeout_seconds:.0f}s of sending Quit/N (PIDs still "
+            f"running: {remaining_pids}). {consequence} "
+            + (
+                f"It shows these dialogs: {_describe_dialogs(dialogs)}, answer them with "
+                "click_igor_dialog_button or ask the user."
+                if dialogs
+                else "It shows no dialog, retry with a longer process_exit_timeout_seconds."
+            )
+        )
+
+    return discarded_save_dialogs
+
+
 @mcp.tool()
 def load_experiment(
     file_path: str,
@@ -2579,35 +2615,10 @@ def load_experiment(
     if not os.path.isfile(normalized):
         raise RuntimeError(f"'{normalized}' does not exist or is not a file.")
 
-    igor_basename_lower = os.path.basename(_configured_igor_exe_path).lower()
-
-    try:
-        call_function("ZBR#ZBR_SubmitCommand", ["Quit/N"])
-    except (IgorZmqError, IgorZmqUnreachable):
-        pass  # nothing was running/reachable to begin with -- nothing to quit
-
-    quit_deadline = time.monotonic() + process_exit_timeout_seconds
-    discarded_save_dialogs = []
-    remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
-    while remaining_pids and time.monotonic() < quit_deadline:
-        discarded_save_dialogs += _discard_save_experiment_dialogs(remaining_pids)
-        time.sleep(0.5)
-        remaining_pids = _list_pids_for_exe_basename(igor_basename_lower)
-
-    if remaining_pids:
-        dialogs = [d for d in _possible_dialogs() if d["pid"] in remaining_pids]
-        raise RuntimeError(
-            f"'{igor_basename_lower}' did not fully exit within "
-            f"{process_exit_timeout_seconds:.0f}s of sending Quit/N (PIDs still "
-            f"running: {remaining_pids}). Relaunching now would risk silently doing "
-            "nothing (see this tool's own docstring). "
-            + (
-                f"It shows these dialogs: {_describe_dialogs(dialogs)}, answer them with "
-                "click_igor_dialog_button or ask the user."
-                if dialogs
-                else "It shows no dialog, retry with a longer process_exit_timeout_seconds."
-            )
-        )
+    discarded_save_dialogs = _quit_igor(
+        process_exit_timeout_seconds,
+        "Relaunching now would risk silently doing nothing (see this tool's own docstring).",
+    )
 
     try:
         subprocess.Popen(
