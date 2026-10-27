@@ -199,6 +199,7 @@ import win32con
 import win32gui
 import win32process
 
+import comtypes.client
 import zmq
 
 from mcp.server.fastmcp import FastMCP
@@ -463,10 +464,10 @@ def _diagnose_no_reply() -> str:
     except Exception:
         return "See check_bridge_health."
     if dialogs:
-        titles = ", ".join(repr(d["title"]) for d in dialogs)
         return (
-            f"Igor Pro is running and shows these windows besides its main window: {titles}. "
-            "A modal dialog blocks the bridge -- see list_igor_windows/close_igor_window."
+            "Igor Pro is running and shows these windows besides its main window: "
+            f"{_describe_dialogs(dialogs)}. A modal dialog blocks the bridge -- see "
+            "list_igor_windows, click_igor_dialog_button and close_igor_window."
         )
     rebind = (
         f"Requested a rebind of the socket at {_igor_zmq_endpoint()} (e.g. after zeromq_stop() "
@@ -1901,27 +1902,6 @@ def _list_igor_pids() -> list:
     return pids
 
 
-def _child_window_texts(hwnd) -> list:
-    """Texts of the native child controls, e.g. the message and the button captions of a
-    standard dialog. Qt windows have no native child controls, so this is empty for them."""
-    texts = []
-
-    def _callback(child, _extra):
-        try:
-            text = win32gui.GetWindowText(child)
-        except Exception:
-            text = ""
-        if text:
-            texts.append(text)
-        return True
-
-    try:
-        win32gui.EnumChildWindows(hwnd, _callback, None)
-    except Exception:
-        pass
-    return texts
-
-
 def _igor_windows(include_hidden: bool = False) -> list:
     windows = []
 
@@ -1945,12 +1925,14 @@ def _igor_windows(include_hidden: bool = False) -> list:
                 "is_main_window": bool(_MAIN_WINDOW_TITLE_REGEXP.search(title)),
                 "process": exe_name,
                 "pid": pid,
-                "child_texts": _child_window_texts(hwnd),
             }
         )
         return True
 
     win32gui.EnumWindows(_callback, None)
+    for window in windows:
+        if window["visible"] and not window["is_main_window"]:
+            window.update(_dialog_contents(window["hwnd"]))
     return windows
 
 
@@ -1958,6 +1940,13 @@ def _possible_dialogs() -> list:
     """Visible top-level Igor windows other than the main window, typically modal dialogs
     when the bridge does not answer."""
     return [w for w in _igor_windows() if not w["is_main_window"] and w["title"]]
+
+
+def _describe_dialogs(dialogs: list) -> str:
+    return ", ".join(
+        f"{d['title']!r} ({' '.join(d['texts'])})" if d.get("texts") else repr(d["title"])
+        for d in dialogs
+    )
 
 
 def _require_igor_window(hwnd: int):
@@ -1980,16 +1969,80 @@ def _window_gone(hwnd: int) -> bool:
     return not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
 
 
+def _wait_until_gone(hwnd: int) -> bool:
+    deadline = time.monotonic() + _CLOSE_STEP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if _window_gone(hwnd):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+_uia_client = None
+_uia_module = None
+
+
+def _uia():
+    """The UI Automation client and the module with its interfaces and constants. Igor's
+    dialogs are Qt windows without native child controls, only UI Automation sees their
+    texts and buttons."""
+    global _uia_client, _uia_module
+    if _uia_client is None:
+        _uia_module = comtypes.client.GetModule("UIAutomationCore.dll")
+        _uia_client = comtypes.client.CreateObject(
+            _uia_module.CUIAutomation, interface=_uia_module.IUIAutomation
+        )
+    return _uia_client, _uia_module
+
+
+def _dialog_elements(hwnd: int) -> list:
+    client, uia = _uia()
+    found = client.ElementFromHandle(hwnd).FindAll(
+        uia.TreeScope_Descendants, client.CreateTrueCondition()
+    )
+    return [found.GetElement(i) for i in range(found.Length)]
+
+
+def _dialog_contents(hwnd: int) -> dict:
+    texts = []
+    buttons = []
+    try:
+        _, uia = _uia()
+        for element in _dialog_elements(hwnd):
+            name = element.CurrentName
+            if not name:
+                continue
+            control_type = element.CurrentControlType
+            if control_type == uia.UIA_TextControlTypeId:
+                texts.append(name)
+            elif control_type == uia.UIA_ButtonControlTypeId:
+                buttons.append(
+                    {
+                        "name": name,
+                        "access_key": element.CurrentAccessKey or "",
+                        "enabled": bool(element.CurrentIsEnabled),
+                    }
+                )
+    except Exception as e:
+        return {"texts": texts, "buttons": buttons, "contents_error": str(e)}
+    return {"texts": texts, "buttons": buttons}
+
+
+def _button_caption(name: str) -> str:
+    return name.replace("&", "").strip().lower()
+
+
 @mcp.tool()
 def list_igor_windows(include_hidden: bool = False) -> dict:
     """List the top-level windows of the running Igor Pro process(es), e.g. to find a modal
     dialog which blocks the bridge.
 
-    Each entry has "hwnd" (for close_igor_window/send_key_to_igor_window), "title",
-    "class_name", "visible", "owner_hwnd" (dialogs are usually owned by the main window),
-    "is_main_window", "process", "pid" and "child_texts" -- the texts of native child
-    controls like the message and button captions of a standard Windows dialog (empty for
-    Igor's Qt windows, use the title then).
+    Each entry has "hwnd" (for click_igor_dialog_button/close_igor_window/
+    send_key_to_igor_window), "title", "class_name", "visible", "owner_hwnd" (dialogs are
+    usually owned by the main window), "is_main_window", "process" and "pid". Visible
+    windows other than the main window also have "texts" (e.g. the message of a dialog) and
+    "buttons" (each with "name", "access_key" and "enabled"), read via UI Automation, so the
+    title and texts tell which dialog it is and how to answer it.
 
     Use this when the bridge does not answer although Igor Pro is running: a modal dialog
     blocks Igor's operation queue and with it the bridge, see check_bridge_health."""
@@ -2006,14 +2059,16 @@ def close_igor_window(hwnd: int, press_enter: bool = False) -> dict:
     confirmation after an error ignores WM_CLOSE but closes on Escape. Closing one dialog
     can open the next one, so call list_igor_windows/check_bridge_health again afterward.
 
-    Dialogs without a Cancel button, e.g. a Yes/No question of DoAlert, ignore both. With
-    `press_enter`, the Enter key is tried last, which **selects the dialog's default
-    button** -- e.g. "Yes", or "Save" in a "save changes?" dialog. Only pass it when that
-    choice is fine, ask the user otherwise.
+    Dialogs without a Cancel button, e.g. a Yes/No question of DoAlert, ignore both; answer
+    them with click_igor_dialog_button. With `press_enter`, the Enter key is tried last,
+    which **selects the dialog's default button** -- e.g. "Yes", or "Save" in a "save
+    changes?" dialog. Only pass it when that choice is fine, ask the user otherwise.
 
-    Returns {"closed": bool, "method": the step which closed it, "title": its title}."""
+    Returns {"closed": bool, "method": the step which closed it, "title": its title,
+    "texts": the texts of the window before closing it}."""
     _require_igor_window(hwnd)
     title = win32gui.GetWindowText(hwnd)
+    texts = _dialog_contents(hwnd)["texts"]
 
     steps = (
         ("WM_CLOSE", lambda: win32api.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)),
@@ -2026,19 +2081,58 @@ def close_igor_window(hwnd: int, press_enter: bool = False) -> dict:
             action()
         except Exception:
             pass
-        deadline = time.monotonic() + _CLOSE_STEP_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            if _window_gone(hwnd):
-                return {"closed": True, "method": name, "title": title}
-            time.sleep(0.1)
+        if _wait_until_gone(hwnd):
+            return {"closed": True, "method": name, "title": title, "texts": texts}
 
-    result = {"closed": False, "method": None, "title": title}
+    result = {"closed": False, "method": None, "title": title, "texts": texts}
     if not press_enter:
         result["note"] = (
             "Neither WM_CLOSE nor Escape closed it, the dialog probably has no Cancel "
-            "button. press_enter=True selects its default button."
+            "button. Answer it with click_igor_dialog_button."
         )
     return result
+
+
+@mcp.tool()
+def click_igor_dialog_button(hwnd: int, button: str) -> dict:
+    """Click a button of an Igor Pro dialog by its caption (case-insensitive), without
+    changing the OS focus, e.g. "No" in the "Do you want to save changes to experiment
+    ...?" dialog, which neither close_igor_window nor a key press can select.
+
+    Decide on the button from the dialog's "title", "texts" and "buttons" of
+    list_igor_windows. Only click a button whose consequence is clear, ask the user
+    otherwise. Answering one dialog can open the next one.
+
+    Returns {"clicked": True, "button": its caption, "title", "texts": the texts of the
+    dialog, "closed": bool}. Raises if the dialog has no enabled button with that caption."""
+    _require_igor_window(hwnd)
+    title = win32gui.GetWindowText(hwnd)
+    contents = _dialog_contents(hwnd)
+    _, uia = _uia()
+    wanted = _button_caption(button)
+    for element in _dialog_elements(hwnd):
+        if (
+            element.CurrentControlType == uia.UIA_ButtonControlTypeId
+            and _button_caption(element.CurrentName or "") == wanted
+            and element.CurrentIsEnabled
+        ):
+            break
+    else:
+        raise RuntimeError(
+            f"Dialog {title!r} has no enabled button {button!r}, its buttons: "
+            f"{contents['buttons']}."
+        )
+
+    caption = element.CurrentName
+    pattern = element.GetCurrentPattern(uia.UIA_InvokePatternId)
+    pattern.QueryInterface(uia.IUIAutomationInvokePattern).Invoke()
+    return {
+        "clicked": True,
+        "button": caption,
+        "title": title,
+        "texts": contents["texts"],
+        "closed": _wait_until_gone(hwnd),
+    }
 
 
 @mcp.tool()

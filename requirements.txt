@@ -70,6 +70,13 @@ pyzmq==27.1.0 \
     --hash=sha256:190cbf120fbc0fc4957b56866830def56628934a9d112aec0e2507aa6a032b97 \
     --hash=sha256:9ce490cf1d2ca2ad84733aa1d69ce6855372cb5ce9223802450c9b2a7cba0ccf
 
+# comtypes: UI Automation client, reads the texts and buttons of Igor's dialogs and clicks
+# their buttons (list_igor_windows, click_igor_dialog_button). Igor's dialogs are Qt
+# windows without native child controls, so pywin32's window functions do not see them.
+# Pure Python wheel without dependencies of its own.
+comtypes==1.4.17; sys_platform == "win32" \
+    --hash=sha256:4e0a221dde2c589b82977bed802efd71cd5eb67a380347b732e02735e597f586
+
 # --- Transitive dependencies (mcp's own dependency tree) -------------------------
 # Required by pip's hash-checking mode (see the top comment) -- pip resolves these
 # via mcp's own pyproject.toml at install time regardless, this just makes each one

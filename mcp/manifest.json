@@ -87,11 +87,15 @@
     },
     {
       "name": "list_igor_windows",
-      "description": "List the top-level windows of Igor Pro, e.g. a modal dialog blocking the bridge"
+      "description": "List the top-level windows of Igor Pro with the texts and buttons of dialogs, e.g. a modal dialog blocking the bridge"
     },
     {
       "name": "close_igor_window",
       "description": "Close a window or dialog of Igor Pro via WM_CLOSE or Escape (Enter, i.e. the default button, only on request) without changing the focus"
+    },
+    {
+      "name": "click_igor_dialog_button",
+      "description": "Click a button of an Igor Pro dialog by its caption, e.g. No in a save changes dialog, without changing the focus"
     },
     {
       "name": "send_key_to_igor_window",

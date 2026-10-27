@@ -7,4 +7,5 @@ dependencies = [
     "mcp>=1.29.0,<2",
     "pyzmq==27.1.0",
     "pywin32==312; sys_platform == 'win32'",
+    "comtypes==1.4.17; sys_platform == 'win32'",
 ]

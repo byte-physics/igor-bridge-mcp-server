@@ -304,7 +304,8 @@ suppress the popup the way it does for an ordinary runtime error. This would han
 unattended use exactly like the stale-refnum and out-of-range-write bugs above. **General
 rule: never use `Abort "<message>"` for an expected/recoverable failure path in any code
 this bridge might run unattended -- set an error status value directly instead**, since
-there is no scriptable way to dismiss the resulting dialog.
+the resulting dialog blocks the bridge until it is clicked away from outside Igor
+(`click_igor_dialog_button`).
 
 ### `ZBR_ProcedureText`: window name is the THIRD argument
 
@@ -458,3 +459,15 @@ follow-up calls instead of re-declaring.
   `StartZeroMQSockets(forceRestart = 1)` called `zeromq_stop()` and restarted the handler with
   only its own binds. The background task `ZBR_BindKeeper` therefore only rebinds when the
   bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.
+
+## Dialogs: reading and answering them via UI Automation
+
+- Igor's dialogs are Qt windows (class `Qt5QWindow`) without native child controls, so
+  `EnumChildWindows`/`GetWindowText` only see their title. UI Automation (`comtypes`,
+  `UIAutomationCore.dll`) sees everything: the message as Text elements (AutomationIds like
+  `IgorMDIMain.StdAlert._alertTextLabel`/`_detailedTextLabel`, `IgorMDIMain.DoAlertDialog.*`,
+  `IgorMDIMain.ErrorDialog.errorMessageLabel`) and the buttons with their access keys
+  ("Enter" marks the default button). Verified 2026-10-27 with Igor Pro 9.06B01.
+- A button's InvokePattern clicks it without OS focus and works for every button. Keys
+  posted to the window cannot select "No": a Yes/No `DoAlert` ignores WM_CLOSE and Escape,
+  and Enter selects "Yes". Invoking "No" made `DoAlert` return `V_flag` 2.
