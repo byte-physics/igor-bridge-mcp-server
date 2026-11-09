@@ -235,9 +235,10 @@ file recompiled.
 ZeroMQ-XOP's own introductory example. `zeromq_stop()` stops *every* ZeroMQ bind/
 connection/handler for the whole Igor Pro instance, not just this module's own --
 calling it unconditionally would tear down any other ZeroMQ subsystem the same
-experiment might have set up independently. Calling `zeromq_server_bind` directly,
-without stopping first, is safe to repeat: if this module's own socket is already
-bound, the call simply errors ("Address in use"), caught rather than propagated.
+experiment might have set up independently. Binding without stopping first is safe to
+repeat: `zeromq_get_bound_endpoints()` tells whether this module's own socket is already
+bound, and the bind is skipped then. With older ZeroMQ-XOP versions the bind simply errors
+("Address in use"), caught rather than propagated.
 
 **Why the handler-stop-before-recompile step exists at all**: a background thread inside
 the ZeroMQ-XOP keeps dispatching incoming `CallFunction` requests regardless of what
@@ -453,12 +454,16 @@ follow-up calls instead of re-declaring.
 - Closing procedure windows (`CloseProc`) immediately followed by a recompile crashed Igor 9.06
   (access violation in Igor64.exe). The scratch procedures therefore never close or create
   procedure windows; they only rewrite the file on disk and reload.
-- The ZeroMQ-XOP has no silent way to tell whether our socket is still bound. A bind attempt
-  prints "Address in use" into the history (a background task retrying it every 10 s filled
-  the history), and `zeromq_handler_start()` reports a running handler also after MIES's
-  `StartZeroMQSockets(forceRestart = 1)` called `zeromq_stop()` and restarted the handler with
-  only its own binds. The background task `ZBR_BindKeeper` therefore only rebinds when the
-  bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.
+- Older ZeroMQ-XOP versions have no silent way to tell whether our socket is still bound. A
+  bind attempt prints "Address in use" into the history (a background task retrying it every
+  10 s filled the history), and `zeromq_handler_start()` reports a running handler also after
+  MIES's `StartZeroMQSockets(forceRestart = 1)` called `zeromq_stop()` and restarted the
+  handler with only its own binds. The background task `ZBR_BindKeeper` therefore rebinds when
+  the bridge, which gets no reply, writes `%LOCALAPPDATA%\igor-pro-bridge\rebind-request-<port>`.
+  Since ZeroMQ-XOP version-457 (PR 84), `zeromq_get_bound_endpoints()` returns the bound
+  endpoints, so the task also checks every 10 s whether ours is still bound and rebinds it
+  otherwise, without a request. The request file stays for a bound socket whose handler was
+  stopped, and for older XOPs.
 
 ## Igor Pro profiles
 

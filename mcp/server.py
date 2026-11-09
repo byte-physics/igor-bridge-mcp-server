@@ -445,10 +445,12 @@ def _rebind_request_file():
 
 
 def _request_rebind() -> bool:
-    """Ask Igor Pro to rebind the socket of this bridge, e.g. after zeromq_stop() of other
-    code. Its background task ZBR_BindKeeper checks for the request file every
-    _REBIND_KEEPER_PERIOD_SECONDS while no procedure code runs. A request while Igor Pro is
-    only busy is harmless: the bind attempt then just fails with \"Address in use\"."""
+    """Ask Igor Pro to rebind the socket of this bridge and restart its handler, e.g. after
+    zeromq_stop() of other code. Its background task ZBR_BindKeeper checks for the request
+    file every _REBIND_KEEPER_PERIOD_SECONDS while no procedure code runs. With a ZeroMQ-XOP
+    that returns the bound endpoints, it also rebinds a lost socket without a request. A
+    request while Igor Pro is only busy is harmless: the socket is still bound then, and only
+    the handler is started again."""
     if not os.environ.get("LOCALAPPDATA"):
         return False
     path = _rebind_request_file()
