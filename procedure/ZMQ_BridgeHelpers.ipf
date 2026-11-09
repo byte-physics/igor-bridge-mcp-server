@@ -26,6 +26,10 @@ static StrConstant ZBR_ZEROMQ_ENDPOINT     = "tcp://127.0.0.1"
 static Constant    ZBR_ZEROMQ_DEFAULT_PORT = 5680
 static StrConstant ZBR_ZEROMQ_ENV_PORT     = "IGOR_PRO_BRIDGE_PORT"
 
+/// ZMQ_SOCKET_TYPE_SERVER of the ZeroMQ-XOP's ZeroMQ_Interop.ipf, which this independent
+/// module can not include
+static Constant ZBR_ZMQ_SOCKET_TYPE_SERVER = 2
+
 static StrConstant ZBR_RECOMPILE_WATCHDOG_TASK = "ZBR_RecompileWatchdog"
 static StrConstant ZBR_BIND_KEEPER_TASK        = "ZBR_BindKeeper"
 static Constant    ZBR_BIND_KEEPER_PERIOD      = 600 ///< [ticks], 10 s
@@ -879,9 +883,9 @@ End
 
 /// (Re-)binds this module's ZeroMQ ROUTER socket and starts its handler. Does not call
 /// zeromq_stop() first, so it won't tear down any other ZeroMQ binds in the same
-/// experiment (e.g. MIES's own). Safe to call repeatedly -- an already-bound error is
-/// caught, not propagated. Also starts the background task ZBR_BindKeeper, which rebinds
-/// the socket on request of the bridge, see ZBR_BindKeeperTick(). Called from
+/// experiment (e.g. MIES's own). Safe to call repeatedly -- an already bound socket is not
+/// bound again, and a failed bind is caught, not propagated. Also starts the background
+/// task ZBR_BindKeeper, which rebinds the socket when needed, see ZBR_BindKeeperTick(). Called from
 /// IgorStartOrNewHook; recompiles instead just
 /// stop/restart the handler via ZBR_StopHandlerBeforeRecompile/
 /// ZBR_StartHandlerAfterRecompile, not a full rebind. See SESSION_NOTES.md.
@@ -907,16 +911,17 @@ static Function ZBR_StartBindKeeper()
 	return 0
 End
 
-/// Background task: Rebind the socket and restart the handler when the bridge requests it,
-/// e.g. after zeromq_stop() of other code, which tears down all ZeroMQ sockets of the
-/// process. Skipped while a reload/compile of the bridge runs, which stops the handler on
-/// purpose.
+/// Background task: Rebind the socket and restart the handler when our endpoint is no
+/// longer bound, e.g. after zeromq_stop() of other code, which tears down all ZeroMQ
+/// sockets of the process, or when the bridge requests it. Skipped while a reload/compile
+/// of the bridge runs, which stops the handler on purpose.
 ///
-/// The ZeroMQ-XOP can not tell silently whether a socket is bound: a bind attempt prints
-/// "Address in use" into the history, and zeromq_handler_start() reports a running
-/// handler also when other code, e.g. MIES, restarted it with only its own binds. So the
-/// bridge, which gets no reply then, writes a request file (see
-/// ZBR_GetRebindRequestFile()) and this task only checks for it.
+/// zeromq_handler_start() reports a running handler also when other code, e.g. MIES,
+/// restarted it with only its own binds, so the bound endpoints tell whether our socket
+/// is still bound, see ZBR_IsEndpointBound(). The bridge, which gets no reply when the
+/// socket is bound but the handler stopped, writes a request file (see
+/// ZBR_GetRebindRequestFile()). It is the only trigger with ZeroMQ-XOP versions which
+/// can not return the bound endpoints.
 Function ZBR_BindKeeperTick(STRUCT WMBackgroundStruct &s)
 
 	string requestFile
@@ -926,17 +931,18 @@ Function ZBR_BindKeeperTick(STRUCT WMBackgroundStruct &s)
 	endif
 
 	requestFile = ZBR_GetRebindRequestFile()
-	if(!strlen(requestFile))
-		return 0
+	if(strlen(requestFile))
+		GetFileFolderInfo/Q/Z requestFile
+		if(!V_flag && V_isFile)
+			DeleteFile/Z requestFile
+			ZBR_BindSocket()
+			return 0
+		endif
 	endif
 
-	GetFileFolderInfo/Q/Z requestFile
-	if(V_flag || !V_isFile)
-		return 0
+	if(ZBR_IsEndpointBound(ZBR_GetEndpoint(ZBR_GetPort())) == 0)
+		ZBR_BindSocket()
 	endif
-
-	DeleteFile/Z requestFile
-	ZBR_BindSocket()
 
 	return 0
 End
@@ -980,18 +986,52 @@ static Function ZBR_GetPort([variable verbose])
 	return port
 End
 
-/// Bind the ZeroMQ ROUTER socket of this module and start the handler, see
-/// ZBR_EnsureZeroMQBound()
+/// Endpoint of our ZeroMQ ROUTER socket, e.g. tcp://127.0.0.1:5680
+///
+/// @param port port, see ZBR_GetPort()
+static Function/S ZBR_GetEndpoint(variable port)
+
+	string endpoint
+
+	sprintf endpoint, "%s:%d", ZBR_ZEROMQ_ENDPOINT, port
+
+	return endpoint
+End
+
+/// Return 1 if this Igor Pro instance has the server endpoint bound, 0 if not and NaN if
+/// the ZeroMQ-XOP can not tell (versions without zeromq_get_bound_endpoints())
+static Function ZBR_IsEndpointBound(string endpoint)
+
+#if exists("zeromq_get_bound_endpoints")
+	variable err
+
+	WAVE/Z/T endpoints = zeromq_get_bound_endpoints(ZBR_ZMQ_SOCKET_TYPE_SERVER); err = GetRTError(1)
+	if(err || !WaveExists(endpoints))
+		return 0
+	endif
+
+	FindValue/TEXT=endpoint/TXOP=4 endpoints
+
+	return V_value >= 0
+#else
+	return NaN
+#endif
+End
+
+/// Bind the ZeroMQ ROUTER socket of this module unless it is bound already, and start the
+/// handler, see ZBR_EnsureZeroMQBound()
 static Function ZBR_BindSocket()
 
 	variable err, port
-	string bindURL
+	string endpoint
 
-	port = ZBR_GetPort(verbose = 1)
-	sprintf bindURL, "%s:%d", ZBR_ZEROMQ_ENDPOINT, port
-	zeromq_server_bind(bindURL); err = GetRTError(1)
-	if(!err)
-		printf "Igor Pro Bridge MCP bound through ZMQ at port %d\r", port
+	port     = ZBR_GetPort(verbose = 1)
+	endpoint = ZBR_GetEndpoint(port)
+	if(ZBR_IsEndpointBound(endpoint) != 1)
+		zeromq_server_bind(endpoint); err = GetRTError(1)
+		if(!err)
+			printf "Igor Pro Bridge MCP bound through ZMQ at port %d\r", port
+		endif
 	endif
 	zeromq_handler_start(); err = GetRTError(1)
 
