@@ -225,6 +225,10 @@ _ZMQ_DEFAULT_RECV_TIMEOUT_MS = 5000
 _ZMQ_SEND_TIMEOUT_MS = 2000
 _ZMQ_LINGER_MS = 0
 
+# MAX_SERVER_MESSAGE_SIZE of the ZeroMQ-XOP (src/GlobalData.cpp): its server socket drops a
+# larger request and the connection without any reply.
+_ZMQ_MAX_REQUEST_BYTES = 65536
+
 # Set by configure_igor_launch(port=...) -- see that tool's docstring. None means
 # "use IGOR_ZMQ_DEFAULT_PORT".
 _configured_igor_port = None
@@ -254,6 +258,10 @@ def _igor_zmq_endpoint():
 
 class IgorZmqError(RuntimeError):
     """Igor Pro replied, but reported errorCode.value != 0 for the CallFunction call."""
+
+
+class IgorRequestTooLarge(ValueError):
+    """The request exceeds the maximum message size of the ZeroMQ-XOP and was not sent."""
 
 
 class IgorZmqUnreachable(RuntimeError):
@@ -383,6 +391,9 @@ def call_function(name, params=None, timeout_ms=_ZMQ_DEFAULT_RECV_TIMEOUT_MS):
     IgorZmqError if Igor Pro replied but reported errorCode.value != 0 (the error
     message includes any "history" the XOP reports alongside the error, which often
     shows exactly where inside the called function things went wrong).
+
+    Raises IgorRequestTooLarge without sending if the request exceeds
+    _ZMQ_MAX_REQUEST_BYTES.
     """
     request = {
         "version": 1,
@@ -390,6 +401,15 @@ def call_function(name, params=None, timeout_ms=_ZMQ_DEFAULT_RECV_TIMEOUT_MS):
         "CallFunction": {"name": name, "params": list(params) if params else []},
     }
     payload = json.dumps(request)
+
+    size = len(payload.encode("utf-8"))
+    if size > _ZMQ_MAX_REQUEST_BYTES:
+        raise IgorRequestTooLarge(
+            f"The request calling {name!r} has {size} bytes, but the ZeroMQ-XOP drops "
+            f"requests larger than {_ZMQ_MAX_REQUEST_BYTES} bytes without a reply, so it was "
+            f"not sent. Use run_igor_code for long code, it passes the code in a procedure "
+            f"file."
+        )
 
     endpoint = _igor_zmq_endpoint()
     sock = _get_zmq_context().socket(zmq.REQ)
