@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "igor-pro-bridge",
   "display_name": "Igor Pro Bridge",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "Control a running Igor Pro instance via the ZeroMQ-XOP's CallFunction interface: run commands, read wave data, manage compilation, load experiments, and launch Igor Pro itself, directly from Claude.",
-  "long_description": "v3.1.0: dialogs, screenshots, profiles and a more robust restart. `list_igor_windows` reads the texts and buttons of Igor's dialogs via UI Automation (replacing `child_texts`, which only worked for native Windows dialogs), the new `click_igor_dialog_button` clicks any button by its caption, e.g. \"No\" in a save question, `close_igor_window` returns the texts it closed, and the new `capture_igor_window` returns a screenshot of a window, also of controls which UI Automation can not read. `load_experiment` answers the old instance's \"save changes to experiment?\" question with \"No\", sends Quit/N again while Igor Pro does not answer and refuses with a clear error while the procedures are not compiled. The new `switch_igor_profile` quits Igor Pro, activates another user files folder by renaming the folders and relaunches it. The background task which rebinds the socket after `zeromq_stop()` of other code now survives opening an experiment. New dependency `comtypes` (run install.ps1 again); `colorama` is pinned, so a fresh install works again.",
+  "long_description": "v3.1.1: the bundled ZeroMQ-XOP is updated to version-459-gd9173ee. With it, the background task rebinds the bridge socket on its own after `zeromq_stop()` of other code, without waiting for a failed request, and can no longer hang Igor Pro. Requests larger than the 64 KiB the XOP accepts are rejected with a clear error instead of running into the receive timeout; use `run_igor_code` for long code. Install the new XOP from the ZeroMQ-XOP folder.",
   "author": {
     "name": "Michael Huth"
   },

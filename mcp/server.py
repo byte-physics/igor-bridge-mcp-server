@@ -4,6 +4,9 @@ Igor Pro MCP bridge server
 
 Exposes a running Igor Pro instance to Claude (or any MCP client) as a set of MCP tools.
 
+**v3.1.1**: the bundled ZeroMQ-XOP 459 lets the bind keeper rebind a lost socket on
+its own; requests larger than the XOP's 64 KiB limit are rejected before sending.
+
 **v3.1.0**: dialogs are read and answered via UI Automation (`click_igor_dialog_button`),
 `capture_igor_window` returns screenshots, `switch_igor_profile` switches the user files
 folder, and `load_experiment` handles the save question, a silent or an uncompiled Igor Pro.
@@ -1754,7 +1757,7 @@ def edit_help_file(
 # reason as before: the on-disk layout after Claude Desktop installs a .mcpb isn't
 # guaranteed to keep server.py and manifest.json at a fixed relative path, and this
 # needs to be confirmable from inside a conversation independent of that.
-_BRIDGE_VERSION = "3.1.0"
+_BRIDGE_VERSION = "3.1.1"
 
 
 def _installed_package_version(distribution_name: str) -> str | None:
