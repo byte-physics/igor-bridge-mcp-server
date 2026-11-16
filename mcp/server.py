@@ -599,8 +599,9 @@ def execute_igor_command(
     for the command and restored afterward, as a Debugger pause in procedure code cannot be
     resumed by the bridge and would hang the command (see set_debugger_enabled).
 
-    Errors never open a modal dialog. Returns {"output": captured history text, "error":
-    error message or ""}.
+    Errors of the command itself never open a modal dialog, but those of an `Execute`
+    without `/Z` inside it do. Returns {"output": captured history text, "error": error
+    message or ""}.
 
     Example: execute_igor_command('WaveStats/Q jack; print V_avg')
     """

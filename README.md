@@ -14,7 +14,8 @@ functions in `procedure/ZMQ_BridgeHelpers.ipf` (the `ZBR` independent module).
   It is the default way to run anything beyond a short command.
 - **Run commands** — `execute_igor_command` runs a command line and returns what it
   printed and its error message. By default Igor's Debugger is disabled for the call,
-  so a Debugger pause can't hang it; errors never open a modal dialog.
+  so a Debugger pause can't hang it; errors never open a modal dialog, except those of
+  an `Execute` without `/Z` inside the command.
 - **Long-running commands** — `submit_igor_command` queues a command and returns a
   token immediately without waiting; `poll_igor_command` checks completion later.
   Reliable across bridge/Claude Desktop restarts, and across waits of any length
