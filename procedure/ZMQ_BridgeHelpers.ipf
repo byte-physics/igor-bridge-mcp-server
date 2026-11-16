@@ -641,6 +641,32 @@ End
 
 // --- Compilation state -------------------------------------------------------------
 
+/// Return the selection of a procedure window and the text of its first line
+///
+/// After a compile error, Igor Pro selects the offending token in the procedure window, also
+/// when the "Function Compilation Error" dialog is closed, so this gives the error location
+/// the dialog does not show. `paragraph` and the positions are zero-based. `found` is 0 if the
+/// window does not exist.
+Function [variable found, variable paragraph, variable startPos, variable endPos, string lineText] ZBR_GetProcedureSelection(string procWinTitle)
+
+	variable err
+
+	try
+		GetSelection procedure, $procWinTitle, 1; AbortOnRTE
+	catch
+		err = GetRTError(1)
+		return [0, NaN, NaN, NaN, ""]
+	endtry
+
+	if(!V_flag)
+		return [0, NaN, NaN, NaN, ""]
+	endif
+
+	lineText = StringFromList(V_startParagraph, ProcedureText("", 0, procWinTitle), "\r")
+
+	return [1, V_startParagraph, V_startPos, V_endPos, lineText]
+End
+
 /// True if ProcGlobal is compiled. Must qualify the FunctionInfo() probe with
 /// "ProcGlobal#" -- an unqualified name resolves against this (always-compiled)
 /// independent module instead. See SESSION_NOTES.md.
