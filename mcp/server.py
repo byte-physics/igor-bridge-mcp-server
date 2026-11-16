@@ -807,7 +807,10 @@ def reload_and_compile_procedures() -> dict:
     Igor Pro only prints them if it was launched with /UNATTENDED (see
     launch_igor_pro_unattended), otherwise it shows a modal dialog instead. If NOT launched /UNATTENDED, a
     stuck "Function Compilation Error" dialog is also possible -- this tool tries to
-    close it, see also list_igor_windows/close_igor_window. As of v2.3.1, the bridge itself should still be
+    close it, see also list_igor_windows/close_igor_window. When it closed one,
+    "dialog_error" holds its "message", "procedure_window" and "function", and from the
+    token Igor Pro selected in that procedure window the one-based "line" and "column",
+    the "source_line" and the "token". As of v2.3.1, the bridge itself should still be
     reachable in this case (see the watchdog fix above) -- fix the .ipf and call this
     tool again rather than needing to relaunch Igor Pro.
     """
@@ -832,6 +835,56 @@ def _compile_errors_since(history_start) -> list:
     except (IgorZmqError, IgorZmqUnreachable):
         return []
     return _COMPILE_ERROR_REGEXP.findall((text or "").replace("\r", "\n"))
+
+
+# Last text of the "Function Compilation Error" dialog: "<procedure window>:<function>"
+_COMPILE_ERROR_DIALOG_LOCATION_REGEXP = re.compile(r"^(?P<window>.+):(?P<function>[^:]+)$")
+_COMPILE_ERROR_DIALOG_IN_TEXT = "Error in"
+_SELECTION_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+
+def _compile_error_from_dialog(dismiss_result: dict):
+    """The error of the "Function Compilation Error" dialog that
+    _attempt_dismiss_compile_error_dialog closed, or None if there was none.
+
+    The dialog shows the message, the procedure window and the function, but no line. Igor
+    Pro selects the offending token in that procedure window, so the selection gives the
+    line and column, and the text of that line. The ZeroMQ handler can still be stopped
+    right after the failed compile, until the recompile watchdog restarts it, so the lookup
+    is retried for a few seconds."""
+    texts = dismiss_result.get("texts") or []
+    if not dismiss_result.get("attempted") or not texts:
+        return None
+
+    error = {"message": texts[0]}
+
+    location = texts[-1] if _COMPILE_ERROR_DIALOG_IN_TEXT in texts[:-1] else ""
+    match = _COMPILE_ERROR_DIALOG_LOCATION_REGEXP.match(location)
+    if match is None:
+        return error
+
+    error["procedure_window"] = match.group("window")
+    error["function"] = match.group("function")
+
+    deadline = time.monotonic() + _SELECTION_LOOKUP_TIMEOUT_SECONDS
+    while True:
+        try:
+            found, paragraph, start_pos, end_pos, line_text = call_function(
+                "ZBR#ZBR_GetProcedureSelection", [error["procedure_window"]]
+            )
+            break
+        except (IgorZmqError, IgorZmqUnreachable):
+            if time.monotonic() >= deadline:
+                return error
+            time.sleep(_COMPILE_POLL_INTERVAL_SECONDS)
+
+    if found:
+        error["line"] = int(paragraph) + 1
+        error["column"] = int(start_pos) + 1
+        error["source_line"] = line_text
+        error["token"] = line_text[int(start_pos) : int(end_pos)]
+
+    return error
 
 
 def _reload_and_compile(before_submit=None) -> dict:
@@ -884,7 +937,7 @@ def _reload_and_compile(before_submit=None) -> dict:
 
     errors = _compile_errors_since(history_start)
     dismiss_result = _attempt_dismiss_compile_error_dialog()
-    return {
+    result = {
         "compiled": False,
         "errors": errors,
         "poll_attempts": attempts,
@@ -892,11 +945,17 @@ def _reload_and_compile(before_submit=None) -> dict:
         "note": (
             "Not compiled. See 'errors' for the '<file>:<line>:<col>: error: ...' lines of "
             "Igor's history (Igor Pro launched with /UNATTENDED prints them there instead of "
-            "showing a dialog), or check for a stuck compile-error dialog (see "
-            "'auto_dismiss_attempted' above). If 'errors' is empty and Igor Pro did not "
-            f"answer within {_COMPILE_POLL_TIMEOUT_SECONDS:.0f}s, see check_bridge_health."
+            "showing a dialog), or 'dialog_error' for the error of the compile-error dialog "
+            "this tool closed. If both are missing and Igor Pro did not answer within "
+            f"{_COMPILE_POLL_TIMEOUT_SECONDS:.0f}s, see check_bridge_health."
         ),
     }
+
+    dialog_error = _compile_error_from_dialog(dismiss_result)
+    if dialog_error is not None:
+        result["dialog_error"] = dialog_error
+
+    return result
 
 
 # --- Scratch procedures (run_igor_code) ----------------------------------------------
