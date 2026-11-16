@@ -136,14 +136,30 @@ quitting, crashing, or restarting.
   string -- a joined `"cmd; finishCall"` string would silently drop the finish-callback
   whenever `cmd` errors, leaving `poll_igor_command` reporting "not done" forever,
   indistinguishable from a job still genuinely running.
-- **There is no reliable, generic way to tell "cmd ran and legitimately printed nothing"
-  apart from "cmd errored out partway through with no output."** `GetRTError(1)` reads
-  `0` inside the finish-callback even after a genuinely-erroring `cmd` -- each
-  `Execute/P` entry is dispatched as its own independent top-level execution, so Igor
-  clears any pending runtime-error state before the queue advances to the next entry.
-  Igor also does not append anything about the error to the `CaptureHistory`-tracked
-  history stream. If a submitted command's success needs to be verifiable, have it
-  `print` an explicit sentinel value/message itself.
+- **A command's error is only available as the `V_flag` of `Execute/Z`, never from
+  `GetRTError(1)` or the history.** `GetRTError(1)` reads `0` inside the finish-callback
+  even after a genuinely-erroring `cmd` -- each `Execute/P` entry is dispatched as its own
+  independent top-level execution, so Igor clears any pending runtime-error state before
+  the queue advances to the next entry. Igor also does not append anything about the error
+  to the `CaptureHistory`-tracked history stream. So every path of `ZBR_QueueCommand`
+  stores the `V_flag` of its `Execute/Z` as `errorCode` of the token, which
+  `ZBR_FinishToken` turns into the `ERROR: ` prefix:
+  - `ZBR_RunCommand`/`ZBR_PG_RunCommand` run `Execute/Z` inside a function, where `V_flag`
+    is a local variable.
+  - Commands which can only run directly in the queue (top-level commands, and without the
+    ProcGlobal include unknown names and macros) run as `Execute/P/Q/Z cmd`. Igor's help
+    on `Execute/P` only says that `/Z` suppresses error dialogs; it does not mention
+    `V_flag`. Verified in Igor Pro 10.05: `/P/Z` writes the error code to a **global**
+    `V_flag` in the current data folder after the command ran. `ZBR_QueueDirectCommand`
+    therefore queues `ZBR_ResetVFlag()` before the command (so that a `V_flag` of an
+    earlier command can't be read as its error) and `ZBR_StoreVFlag(token)` after it;
+    `ZBR_RememberVFlag`/`ZBR_RemoveVFlag` restore or remove the global `V_flag` around
+    all of it. Until this was added, the errors of directly queued commands were lost,
+    e.g. `print undefinedFunctionXYZ(1)` without the ProcGlobal include returned neither
+    output nor error.
+  - Not covered: `COMPILEPROCEDURES` discards all queue entries behind it, so neither
+    `ZBR_StoreVFlag` nor the finish-callback runs; and an `Execute` without `/Z` *inside*
+    the command opens a modal "Error from Execute" dialog and reports no error code.
 - **Use `print`, not `fprintf 0, ...`, to get data back.** `CaptureHistory` (which the
   submit/poll mechanism relies on) captures `print` output but does NOT capture
   `fprintf`-to-history-refnum output at all (refnum 0, -1, or -2 all silently produce
