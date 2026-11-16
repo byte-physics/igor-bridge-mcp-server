@@ -38,6 +38,8 @@ static StrConstant ZBR_REBIND_REQUEST_FILE     = "rebind-request-"
 
 static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
 static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
+static StrConstant ZBR_RESET_VFLAG_CALL    = "ZBR#ZBR_ResetVFlag()"
+static StrConstant ZBR_STORE_VFLAG_CALL    = "ZBR#ZBR_StoreVFlag(%s)"
 
 /// Commands which only work at the top level of the operation queue or execute further
 /// command strings, see ZBR_QualifyCommand(). The lookahead excludes calls of user functions
@@ -294,7 +296,8 @@ End
 /// current data folder after the command returned. Background tasks can run before the
 /// next queue entry removes it again, e.g. the reentry of a test case started by the
 /// command, which then finds V_flag in its data folder. Commands which can not be
-/// qualified, see ZBR_QualifyCommand(), are still queued directly.
+/// qualified, see ZBR_QualifyCommand(), are still queued directly, see
+/// ZBR_QueueDirectCommand().
 ///
 /// If the ProcGlobal part of the bridge is included, see ZBR_ProcGlobalIncluded(), the command
 /// runs in ProcGlobal context via ZBR_PG_RunCommand(), so constants, functions and macros are
@@ -311,7 +314,7 @@ static Function ZBR_QueueCommand(string token, string cmd)
 	WAVE/T commandText = dfr:commandText
 
 	if(GrepString(cmd, ZBR_TOP_LEVEL_COMMANDS_REGEXP))
-		Execute/P/Q/Z cmd
+		ZBR_QueueDirectCommand(token, cmd)
 		return 0
 	endif
 
@@ -324,13 +327,31 @@ static Function ZBR_QueueCommand(string token, string cmd)
 
 	qualified = ZBR_QualifyCommand(cmd)
 	if(!strlen(qualified))
-		Execute/P/Q/Z cmd
+		ZBR_QueueDirectCommand(token, cmd)
 		return 0
 	endif
 
 	commandText[str2num(token)] = qualified
 	sprintf entry, "ZBR#ZBR_RunCommand(%s)", token
 	Execute/P/Q/Z entry
+
+	return 0
+End
+
+/// Queues the command of the given token as its own queue entry
+///
+/// Execute/P/Z reports an error only in the global V_flag of the current data folder, which
+/// ZBR_RemoveVFlag() removes afterward, so the entries around the command keep it as error
+/// code of the token.
+static Function ZBR_QueueDirectCommand(string token, string cmd)
+
+	string storeCall
+
+	sprintf storeCall, ZBR_STORE_VFLAG_CALL, token
+
+	Execute/P/Q ZBR_RESET_VFLAG_CALL
+	Execute/P/Q/Z cmd
+	Execute/P/Q storeCall
 
 	return 0
 End
@@ -435,6 +456,34 @@ Function ZBR_RunCommand(variable idx)
 	Execute/Z commandText[idx]
 	errorCode[idx]   = V_flag
 	commandText[idx] = ""
+
+	return 0
+End
+
+/// Deferred: Set the global V_flag of the current data folder to 0, so that
+/// ZBR_StoreVFlag() does not report the value of an earlier command. ZBR_RemoveVFlag()
+/// restores or removes it again.
+Function ZBR_ResetVFlag()
+
+	variable/G V_flag = 0
+
+	return 0
+End
+
+/// Deferred: Store the global V_flag of the current data folder as error code of the token,
+/// see ZBR_QueueDirectCommand()
+Function ZBR_StoreVFlag(variable idx)
+
+	NVAR/Z vFlag = V_flag
+
+	DFREF  dfr       = ZBR_GetPackageFolder()
+	WAVE/Z errorCode = dfr:errorCode
+
+	if(!NVAR_Exists(vFlag) || !WaveExists(errorCode) || idx < 0 || idx >= DimSize(errorCode, 0))
+		return 0
+	endif
+
+	errorCode[idx] = vFlag
 
 	return 0
 End
