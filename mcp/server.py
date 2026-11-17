@@ -722,6 +722,8 @@ _COMPILE_POLL_INTERVAL_SECONDS = 0.5
 # Igor Pro 10.03 prints no colon after the column, e.g. "Basic.pxp:File.ipf:134:1 error: ..."
 _COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+:? error: .*$", re.MULTILINE)
 _COMPILE_POLL_TIMEOUT_SECONDS = 15.0
+# After the compile counter went up, how long ProcGlobal may still report uncompiled
+_COMPILE_PROCGLOBAL_RECHECK_SECONDS = 2.0
 
 
 def _read_compile_counter():
@@ -913,11 +915,25 @@ def _reload_and_compile(before_submit=None) -> dict:
             and counter is not None
             and counter > baseline_counter
         ):
-            return {
-                "compiled": True,
-                "poll_attempts": attempts,
-                "confirmed_via": "AfterCompiledHook counter (ZBR_ReadCompileCounter)",
-            }
+            # AfterCompiledHook of the bridge's independent module also runs when ProcGlobal
+            # failed to compile
+            procglobal_compiled = False
+            recheck_deadline = time.monotonic() + _COMPILE_PROCGLOBAL_RECHECK_SECONDS
+            while True:
+                try:
+                    procglobal_compiled = bool(call_function("ZBR#ZBR_IsCompiled"))
+                except (IgorZmqError, IgorZmqUnreachable):
+                    procglobal_compiled = True
+                if procglobal_compiled or time.monotonic() >= recheck_deadline:
+                    break
+                time.sleep(_COMPILE_POLL_INTERVAL_SECONDS)
+            if procglobal_compiled:
+                return {
+                    "compiled": True,
+                    "poll_attempts": attempts,
+                    "confirmed_via": "AfterCompiledHook counter (ZBR_ReadCompileCounter)",
+                }
+            break
 
         # Before the queued reload/compile ran, ZBR_IsCompiled() still reports the state
         # before it, so it only decides once the compile is over.
