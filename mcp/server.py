@@ -719,7 +719,8 @@ def check_compilation_state() -> dict:
 
 
 _COMPILE_POLL_INTERVAL_SECONDS = 0.5
-_COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+: error: .*$", re.MULTILINE)
+# Igor Pro 10.03 prints no colon after the column, e.g. "Basic.pxp:File.ipf:134:1 error: ..."
+_COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+:? error: .*$", re.MULTILINE)
 _COMPILE_POLL_TIMEOUT_SECONDS = 15.0
 
 
