@@ -2101,7 +2101,13 @@ def check_bridge_health() -> dict:
 # closable without OS focus changes. Window titles are not matched against a fixed list
 # (except for the automatic compile-error dismissal), as they depend on Igor's language.
 
-_IGOR_PROCESS_NAME_PREFIX = "igor"
+# Igor64.exe, Igor.exe of 32-bit versions; not e.g. igor-mcp-server.exe of the WaveMetrics
+# MCP server, which has no windows and would look like a hanging Igor Pro
+_IGOR_PROCESS_NAME_REGEXP = re.compile(r"^igor(64)?\.exe$", re.IGNORECASE)
+
+
+def _is_igor_exe(exe_name) -> bool:
+    return bool(exe_name) and bool(_IGOR_PROCESS_NAME_REGEXP.match(exe_name))
 _KNOWN_STUCK_DIALOG_TITLES = ("Function Compilation Error",)
 _SAVE_EXPERIMENT_QUESTION_REGEXP = re.compile(r"^Do you want to save changes to experiment ")
 _POSTED_KEY_GAP_SECONDS = 0.05
@@ -2177,7 +2183,7 @@ def _list_igor_pids() -> list:
         if pid == 0:
             continue
         exe_name = _get_process_exe_name(pid)
-        if exe_name and exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+        if _is_igor_exe(exe_name):
             pids.append(pid)
     return pids
 
@@ -2191,7 +2197,7 @@ def _igor_windows(include_hidden: bool = False) -> list:
             return True
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         exe_name = _get_process_exe_name(pid)
-        if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+        if not _is_igor_exe(exe_name):
             return True
         title = win32gui.GetWindowText(hwnd)
         owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
@@ -2234,7 +2240,7 @@ def _require_igor_window(hwnd: int):
         raise RuntimeError(f"Window {hwnd} does not exist (anymore).")
     _, pid = win32process.GetWindowThreadProcessId(hwnd)
     exe_name = _get_process_exe_name(pid)
-    if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+    if not _is_igor_exe(exe_name):
         raise RuntimeError(f"Window {hwnd} does not belong to an Igor Pro process.")
 
 
