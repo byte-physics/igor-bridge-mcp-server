@@ -1266,8 +1266,14 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
 
     The command runs with Igor's Debugger disabled, see execute_igor_command.
 
+    Then checks for up to 10 s whether the run goes on: a command which fails right away
+    (e.g. for unknown test cases), a dialog which blocks Igor Pro, or a run which ended
+    without JUnit output returns {"started": False, "run_status": ...}. A run which is
+    already finished returns a "note".
+
     Returns {"started_at": time stamp to pass to get_igor_test_results, "junit_folder",
-    "token" of the starting command, "compile": result of the compile step}."""
+    "token" of the starting command (pass it to get_igor_test_results as well), "compile":
+    result of the compile step}."""
     folder = junit_folder or _default_junit_folder()
 
     compile_result = None
@@ -1278,7 +1284,7 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
 
     started_at = time.time()
     token = call_function("ZBR#ZBR_SubmitCommandUnattended", [command])
-    return {
+    result = {
         "started": True,
         "started_at": started_at,
         "junit_folder": folder,
@@ -1286,27 +1292,124 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
         "compile": compile_result,
     }
 
+    status = _test_run_status(token, _TEST_START_CHECK_SECONDS)
+    if status["state"] == "ended" and _junit_result(folder, started_at) is not None:
+        result["note"] = "The run has already finished, see get_igor_test_results."
+    elif status["state"] in ("failed", "blocked", "ended"):
+        result["started"] = False
+        result["run_status"] = status
+    elif status["state"] == "unknown":
+        result["run_status"] = status
+    return result
 
-@mcp.tool()
-def get_igor_test_results(junit_folder: str, started_at: float = 0.0) -> dict:
-    """Return the results of a test run of IgorTest from its JUnit output, see
-    run_igor_tests.
 
-    Looks for the newest JU_*.xml file in `junit_folder` written after `started_at` (as
-    returned by run_igor_tests; 0 takes the newest file). Returns {"finished": False} while
-    there is none yet or it is still being written -- call again later, the test run itself
-    is not affected.
+_TEST_START_CHECK_SECONDS = 10.0
+_TEST_STATUS_SAMPLE_SECONDS = 0.5
+_TEST_RESULTS_POLL_SECONDS = 2.0
+_TEST_BUSY_BACKOFF_SECONDS = 30.0
+# How long a run may stay "between_tasks" before get_igor_test_results reports it stalled
+_TEST_STALLED_SECONDS = 120.0
+# Printed by IgorTest at the start and the end of a run (igortest-hooks.ipf)
+_IUTF_START_MARKER = 'Start of test "'
+_IUTF_END_MARKER = 'End of test "'
+_TEST_RESULTS_MAX_WAIT_SECONDS = 3000.0
+_TEST_OUTPUT_TAIL_CHARS = 3000
 
-    Once finished: {"finished": True, "junit_file", "total": {"tests", "failures",
-    "errors", "skipped"}, "suites": per test suite, "failures": every failed assertion or
-    error with its test case and message}."""
+
+def _idle_within(pid: int, max_seconds: float) -> Optional[bool]:
+    """True as soon as the process `pid` has been idle for _READY_IDLE_SECONDS (see
+    _READY_IDLE_CPU_FRACTION), False if it was busy during all of max_seconds, None if its
+    CPU time can not be read. Does not contact Igor Pro."""
+    deadline = time.monotonic() + max(max_seconds, _READY_IDLE_SECONDS)
+    last_cpu = _process_cpu_seconds(pid)
+    if last_cpu is None:
+        return None
+    idle_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_TEST_STATUS_SAMPLE_SECONDS)
+        cpu = _process_cpu_seconds(pid)
+        if cpu is None:
+            return None
+        if cpu - last_cpu > _READY_IDLE_CPU_FRACTION * _TEST_STATUS_SAMPLE_SECONDS:
+            idle_since = time.monotonic()
+        elif time.monotonic() - idle_since >= _READY_IDLE_SECONDS:
+            return True
+        last_cpu = cpu
+    return False
+
+
+def _test_run_status(token: str, max_seconds: float) -> dict:
+    """State of the test run started by the command `token` of run_igor_tests, without a
+    JUnit file yet.
+
+    Igor Pro is only asked once its process is idle (see _idle_within): a test run without
+    background tasks keeps Igor Pro busy, and requests then only time out. Returns
+    {"state": ...} with
+    - "running": Igor Pro is busy, the command still runs or test background tasks run
+      ("background_tasks")
+    - "blocked": a dialog blocks Igor Pro ("dialogs")
+    - "failed": the command ended with an error ("error", "output")
+    - "ended": the command ended, no test background task runs and the history since the
+      command shows that IgorTest ended the run (_IUTF_END_MARKER) or never started it
+      (no _IUTF_START_MARKER), but there is no JUnit file; e.g. no test case ran or the
+      JUnit output was not enabled ("output")
+    - "between_tasks": the command ended and no test background task runs, but the run
+      started and did not end. IgorTest stops its monitor task before it calls a reentry
+      function and runs it, and the next test case up to its registration, from that
+      task, so this is normal for a short while ("output")
+    - "unknown": Igor Pro does not run or does not answer ("note")"""
+    pids = _list_igor_pids()
+    if not pids:
+        return {"state": "unknown", "note": "Igor Pro is not running."}
+
+    idle = _idle_within(pids[0], max_seconds)
+    if idle is False:
+        return {"state": "running"}
+
+    dialogs = _possible_dialogs()
+    if dialogs:
+        return {"state": "blocked", "dialogs": dialogs, "note": _describe_dialogs(dialogs)}
+
+    try:
+        status = poll_igor_command(token)
+        tasks = []
+        history = ""
+        if status["done"] and not status["error"]:
+            tasks = _running_background_tasks()
+            if not tasks:
+                history = call_function("ZBR#ZBR_GetHistorySinceToken", [token]) or ""
+    except IgorZmqUnreachable:
+        # no dialog, so the run keeps Igor Pro busy although it uses little CPU, e.g.
+        # while it updates windows
+        return {"state": "running", "busy": True}
+    except (IgorZmqError, RuntimeError) as e:
+        return {"state": "unknown", "note": str(e)}
+
+    if not status["done"]:
+        return {"state": "running"}
+
+    output = status["output"] if isinstance(status["output"], str) else ""
+    output = output[-_TEST_OUTPUT_TAIL_CHARS:]
+    if status["error"]:
+        return {"state": "failed", "error": status["error"], "output": output}
+    if tasks:
+        return {"state": "running", "background_tasks": tasks}
+    history_tail = history[-_TEST_OUTPUT_TAIL_CHARS:]
+    if _IUTF_START_MARKER in history and _IUTF_END_MARKER not in history:
+        return {"state": "between_tasks", "output": history_tail}
+    return {"state": "ended", "output": history_tail or output}
+
+
+def _junit_result(junit_folder: str, started_at: float) -> Optional[dict]:
+    """Parsed newest JUnit file written after `started_at`, or {"finished": False, ...} with
+    a note while it is still being written, None if there is none."""
     files = {
         path: mtime
         for path, mtime in _junit_files(junit_folder).items()
         if mtime >= started_at
     }
     if not files:
-        return {"finished": False}
+        return None
 
     newest = max(files, key=files.get)
     if time.time() - files[newest] < _JUNIT_STABLE_SECONDS:
@@ -1317,6 +1420,69 @@ def get_igor_test_results(junit_folder: str, started_at: float = 0.0) -> dict:
     except Exception as e:
         return {"finished": False, "note": f"Could not parse {newest} yet: {e}"}
     return {"finished": True, **result}
+
+
+@mcp.tool()
+def get_igor_test_results(
+    junit_folder: str, started_at: float = 0.0, token: str = "", wait_seconds: float = 0.0
+) -> dict:
+    """Return the results of a test run of IgorTest from its JUnit output, see
+    run_igor_tests.
+
+    Looks for the newest JU_*.xml file in `junit_folder` written after `started_at` (as
+    returned by run_igor_tests; 0 takes the newest file). Returns {"finished": False} while
+    there is none yet or it is still being written -- call again later, the test run itself
+    is not affected.
+
+    With the `token` of run_igor_tests, it also checks whether the run still goes on while
+    there is no JUnit file, see _test_run_status: if the start command failed, the run ended
+    without JUnit output, a dialog blocks Igor Pro, or a started run neither ended nor has a
+    test background task running for 2 minutes while Igor Pro is idle ("stalled"), it
+    returns {"finished": True, "ran": False, "run_status": ...} instead of waiting in vain.
+
+    `wait_seconds` (at most 3000) waits for the results inside this call, checking every
+    few seconds, and returns as soon as they are there or the run is found dead. Prefer
+    it over waiting outside the bridge. Requests reach Igor Pro only while it is idle.
+
+    Once finished: {"finished": True, "junit_file", "total": {"tests", "failures",
+    "errors", "skipped"}, "suites": per test suite, "failures": every failed assertion or
+    error with its test case and message}."""
+    deadline = time.monotonic() + min(max(wait_seconds, 0.0), _TEST_RESULTS_MAX_WAIT_SECONDS)
+    next_status_check = 0.0
+    between_tasks_since = None
+    status = None
+    while True:
+        result = _junit_result(junit_folder, started_at)
+        if result is not None and result["finished"]:
+            return result
+
+        if token and result is None and time.monotonic() >= next_status_check:
+            remaining = deadline - time.monotonic()
+            status = _test_run_status(token, min(max(remaining, 0.0), _TEST_RESULTS_POLL_SECONDS))
+            if status.get("busy"):
+                # unanswered requests only disturb the run
+                next_status_check = time.monotonic() + _TEST_BUSY_BACKOFF_SECONDS
+            if status["state"] != "between_tasks":
+                between_tasks_since = None
+            elif between_tasks_since is None:
+                between_tasks_since = time.monotonic()
+            elif time.monotonic() - between_tasks_since >= _TEST_STALLED_SECONDS:
+                status = {**status, "state": "stalled"}
+                return {"finished": True, "ran": False, "run_status": status}
+            if status["state"] in ("failed", "blocked", "ended"):
+                # the JUnit file may have been written meanwhile
+                result = _junit_result(junit_folder, started_at)
+                if result is not None and result["finished"]:
+                    return result
+                if status["state"] != "ended" or result is None:
+                    return {"finished": True, "ran": False, "run_status": status}
+
+        if time.monotonic() >= deadline:
+            pending = result or {"finished": False}
+            if status is not None:
+                pending["run_status"] = status
+            return pending
+        time.sleep(min(_TEST_RESULTS_POLL_SECONDS, max(deadline - time.monotonic(), 0.0)))
 
 
 # --- Debugger control --------------------------------------------------------------

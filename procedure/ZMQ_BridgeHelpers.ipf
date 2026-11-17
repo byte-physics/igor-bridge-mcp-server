@@ -632,6 +632,24 @@ Function [variable isDone, string result] ZBR_PollCommand(string token)
 	return [1, resultText[idx]]
 End
 
+/// Everything printed to the history since the command of the token started, also after
+/// the command finished, e.g. by test cases running in background tasks. Returns "" for an
+/// unknown token.
+Function/S ZBR_GetHistorySinceToken(string token)
+
+	variable idx
+
+	DFREF dfr          = ZBR_GetPackageFolder()
+	WAVE  historyStart = dfr:historyStart
+
+	idx = str2num(token)
+	if(NumType(idx) != 0 || idx < 0 || idx >= DimSize(historyStart, 0))
+		return ""
+	endif
+
+	return ZBR_HistorySince(historyStart[idx])
+End
+
 // --- Wave access -----------------------------------------------------------------------
 
 /// Returns a wave by its full data-folder path.
