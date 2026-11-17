@@ -514,3 +514,25 @@ follow-up calls instead of re-declaring.
   changes), while a queued `NEWEXPERIMENT` discards the changes without asking.
   `load_experiment` answers only this experiment question with "No" (that is what `Quit/N`
   intends); questions about unsaved procedure files are left to the user.
+
+## Waiting for a launched Igor Pro: ready file instead of polling
+
+`load_experiment` and `launch_igor_pro_unattended` used to call `ZBR#ZBR_Ping` every ~2 s
+(1 s receive timeout plus 1 s pause) until Igor Pro answered. These requests slow the load
+down considerably: Basic.pxp of MIES (261 procedure files) took 41-45 s from opening until
+compiled with the polling, 15 s without it (Igor Pro 10.03, measured with the MIES log hook
+timestamps, 2026-11-17). Each request that timed out also left one "Emergency SendReply ...
+Host unreachable" line of the XOP in the history. Igor Pro runs one core at 100 % during the
+whole load either way; data, compile (6 s) and disk access are not the cause.
+
+Now `ZMQ_BridgeHelpers.ipf` writes `%LOCALAPPDATA%\igor-pro-bridge\ready-<port>.json`
+(`ZBR_WriteReadyFile`: hook name, experiment name, ProcGlobal compiled, socket bound) from
+`IgorStartOrNewHook` and `AfterCompiledHook`. The bridge removes the file before the launch,
+reads only the file until it names the expected experiment with compiled procedures, and then
+confirms with one `ZBR#ZBR_Ping`.
+
+A failed compile calls no hook, so the file never names the experiment then. The bridge
+watches the CPU time of the launched process instead: after 2 s below 25 % of a core (loading
+takes a full core, an idle MIES experiment 3-12 % for its background tasks), it asks Igor Pro
+once for its experiment and `ZBR_IsCompiled()`, which costs nothing while Igor Pro is idle, and
+returns `"compiled": false` with a pointer to the compile error in the history.

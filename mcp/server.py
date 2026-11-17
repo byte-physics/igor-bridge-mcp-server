@@ -2518,6 +2518,159 @@ def configure_igor_launch(exe_path: str, port: Optional[int] = None) -> dict:
 
 
 _POST_LAUNCH_POLL_INTERVAL_SECONDS = 1.0
+_READY_FILE_POLL_INTERVAL_SECONDS = 0.25
+_READY_PING_INTERVAL_SECONDS = 2.0
+_READY_PING_TIMEOUT_MS = 5000
+# A ready file reporting uncompiled procedures may be followed by one of a later successful
+# compile, e.g. of ProcGlobal after the independent module of the bridge
+_READY_NOT_COMPILED_GRACE_SECONDS = 3.0
+# Igor Pro counts as idle while it uses less than this fraction of one core. Loading
+# takes a full core, an idle Basic.pxp of MIES 3-12 % for its background tasks.
+_READY_IDLE_CPU_FRACTION = 0.25
+_READY_IDLE_SECONDS = 2.0
+_READY_PROBE_INTERVAL_SECONDS = 5.0
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _ready_file():
+    """File by which Igor Pro reports its state after a start or compile, see
+    ZBR_WriteReadyFile in ZMQ_BridgeHelpers.ipf:
+    %LOCALAPPDATA%\\igor-pro-bridge\\ready-<port>.json."""
+    port = _igor_zmq_endpoint().rsplit(":", 1)[1]
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "igor-pro-bridge", f"ready-{port}.json"
+    )
+
+
+def _remove_ready_file():
+    """Remove the ready file before a launch, so only the new process can write it."""
+    if not os.environ.get("LOCALAPPDATA"):
+        return
+    try:
+        os.remove(_ready_file())
+    except FileNotFoundError:
+        pass
+
+
+def _read_ready_file() -> Optional[dict]:
+    """Contents of the ready file, None if it does not exist or can not be read."""
+    try:
+        with open(_ready_file(), encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _process_cpu_seconds(pid: int) -> Optional[float]:
+    """CPU time (user + kernel) of the process in seconds, None if it can not be read."""
+    try:
+        handle = win32api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            times = win32process.GetProcessTimes(handle)
+        finally:
+            win32api.CloseHandle(handle)
+    except Exception:
+        return None
+    return (times["UserTime"] + times["KernelTime"]) / 1e7
+
+
+def _probe_igor_state(timeout_ms: int) -> Optional[dict]:
+    """Ask Igor Pro for its experiment and whether its procedures are compiled. None if it
+    does not answer."""
+    try:
+        info = str(call_function("ZBR#ZBR_Ping", timeout_ms=timeout_ms))
+    except (IgorZmqError, IgorZmqUnreachable):
+        return None
+    match = re.search(r"\|experiment=([^|]*)", info)
+    try:
+        compiled = bool(call_function("ZBR#ZBR_IsCompiled", timeout_ms=timeout_ms))
+    except (IgorZmqError, IgorZmqUnreachable):
+        compiled = None
+    return {"experiment": match.group(1) if match else None, "compiled": compiled}
+
+
+def _experiment_matches(name, experiment: Optional[str]) -> bool:
+    return experiment is None or str(name or "").lower() == experiment.lower()
+
+
+def _wait_until_ready(experiment: Optional[str], pid: int, wait_for_ready_seconds: float) -> dict:
+    """Wait until a freshly launched Igor Pro is ready, see _remove_ready_file.
+
+    Igor Pro writes the ready file from IgorStartOrNewHook and AfterCompiledHook. This
+    reads the file until it reports compiled procedures for `experiment` (the experiment
+    name, None for any), and only then confirms with ZBR#ZBR_Ping. Requests from the
+    start slow the load down: with ZBR#ZBR_Ping every 2 s, Basic.pxp of MIES took
+    41-45 s until compiled instead of 15 s.
+
+    A failed compile calls no hook, so the file then never names the experiment. The CPU
+    time of the process `pid` tells when Igor Pro is done anyway: once it has been idle
+    for _READY_IDLE_SECONDS, this asks Igor Pro for its experiment and compile state (at
+    most every _READY_PROBE_INTERVAL_SECONDS), which costs nothing while it is idle.
+
+    Without LOCALAPPDATA there is no ready file, and this polls ZBR#ZBR_Ping as before.
+
+    Returns {"zmq_ready", "compiled" (None if unknown), "poll_attempts" (requests sent),
+    "ready_file" (its last contents or None)}."""
+    deadline = time.monotonic() + wait_for_ready_seconds
+    attempts = 0
+
+    if not os.environ.get("LOCALAPPDATA"):
+        while time.monotonic() < deadline:
+            attempts += 1
+            if _reachable(timeout_ms=1000):
+                return {"zmq_ready": True, "compiled": None, "poll_attempts": attempts, "ready_file": None}
+            time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+        return {"zmq_ready": False, "compiled": None, "poll_attempts": attempts, "ready_file": None}
+
+    def result(zmq_ready, compiled):
+        return {"zmq_ready": zmq_ready, "compiled": compiled, "poll_attempts": attempts, "ready_file": state}
+
+    state = None
+    not_compiled_since = None
+    last_ping = None
+    last_cpu = None
+    idle_since = None
+    last_probe = None
+    while time.monotonic() < deadline:
+        state = _read_ready_file()
+        matches = state is not None and _experiment_matches(state.get("experiment"), experiment)
+        now = time.monotonic()
+        if matches and state.get("compiled"):
+            not_compiled_since = None
+            if last_ping is None or now - last_ping >= _READY_PING_INTERVAL_SECONDS:
+                attempts += 1
+                last_ping = now
+                if _reachable(timeout_ms=_READY_PING_TIMEOUT_MS):
+                    return result(True, True)
+        elif matches:
+            if not_compiled_since is None:
+                not_compiled_since = now
+            elif now - not_compiled_since >= _READY_NOT_COMPILED_GRACE_SECONDS:
+                attempts += 1
+                return result(_reachable(timeout_ms=_READY_PING_TIMEOUT_MS), False)
+        else:
+            cpu = _process_cpu_seconds(pid)
+            busy = cpu is None or last_cpu is None or cpu - last_cpu > _READY_IDLE_CPU_FRACTION * _READY_FILE_POLL_INTERVAL_SECONDS
+            last_cpu = cpu
+            if busy:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = now
+            elif now - idle_since >= _READY_IDLE_SECONDS and (
+                last_probe is None or now - last_probe >= _READY_PROBE_INTERVAL_SECONDS
+            ):
+                attempts += 1
+                last_probe = now
+                probe = _probe_igor_state(_READY_PING_TIMEOUT_MS)
+                if probe is not None and _experiment_matches(probe["experiment"], experiment):
+                    return result(True, probe["compiled"])
+        time.sleep(_READY_FILE_POLL_INTERVAL_SECONDS)
+
+    attempts += 1
+    probe = _probe_igor_state(1000)
+    if probe is None:
+        return result(False, None)
+    return result(True, probe["compiled"] if _experiment_matches(probe["experiment"], experiment) else None)
 
 
 @mcp.tool()
@@ -2551,9 +2704,12 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
     Patches COMSPEC into the child's environment if missing (see
     _build_igor_launch_env) -- needed for MIES's own git-based startup hook.
 
-    After launching, polls for ZBR#ZBR_Ping to start answering (every ~1s) up to
-    wait_for_ready_seconds. Returns whether it became ready and how many polling
-    attempts that took.
+    After launching, waits up to wait_for_ready_seconds for the ready file which
+    ZMQ_BridgeHelpers.ipf writes after the start and after each compile, and then
+    confirms with ZBR#ZBR_Ping, see _wait_until_ready. Requests during the start would
+    slow it down. Returns whether it became ready ("zmq_ready"), whether the procedures
+    are compiled ("compiled"), the number of pings sent ("poll_attempts") and the last
+    contents of the ready file ("ready_file").
     """
     if not _resolve_igor_exe_path():
         raise RuntimeError(
@@ -2574,26 +2730,22 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
             ),
         }
 
+    _remove_ready_file()
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [_configured_igor_exe_path, "/UNATTENDED"],
             env=_build_igor_launch_env(),
         )
     except Exception as e:
         return {"launched": False, "reason": f"Failed to start the process ({e})."}
 
-    deadline = time.monotonic() + wait_for_ready_seconds
-    attempts = 0
-    while time.monotonic() < deadline:
-        attempts += 1
-        if _reachable(timeout_ms=1000):
-            return {"launched": True, "zmq_ready": True, "poll_attempts": attempts}
-        time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+    ready = _wait_until_ready(None, process.pid, wait_for_ready_seconds)
+    if ready["zmq_ready"]:
+        return {"launched": True, **ready}
 
     return {
         "launched": True,
-        "zmq_ready": False,
-        "poll_attempts": attempts,
+        **ready,
         "note": (
             f"The process was started, but nothing answered ZBR#ZBR_Ping within "
             f"{wait_for_ready_seconds:.0f}s. Igor Pro may still be initializing "
@@ -2692,8 +2844,12 @@ def load_experiment(
        `/UNATTENDED` plus the target file path as a launch argument -- passing a file
        path on launch is documented (Advanced Topics.ihf, "Calling Igor from
        Scripts") to open that specific file.
-    4. Polls for the new instance to start answering ZBR#ZBR_Ping, same as
-       launch_igor_pro_unattended.
+    4. Waits for the ready file of the new instance to report the experiment with
+       compiled procedures and confirms with ZBR#ZBR_Ping, same as
+       launch_igor_pro_unattended. Requests while Igor Pro loads the procedures slow
+       the load down considerably (Basic.pxp of MIES: 41-45 s instead of 15 s). If the
+       procedures do not compile, this returns "compiled": False right away instead of
+       waiting for wait_for_ready_seconds.
 
     **Step 2 is not optional, and checking ZeroMQ reachability alone is not enough --
     confirmed live (user report) after an early version of this tool relied on exactly
@@ -2750,8 +2906,9 @@ def load_experiment(
         "Relaunching now would risk silently doing nothing (see this tool's own docstring).",
     )
 
+    _remove_ready_file()
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [_configured_igor_exe_path, "/UNATTENDED", normalized],
             env=_build_igor_launch_env(),
         )
@@ -2760,23 +2917,29 @@ def load_experiment(
             f"Failed to relaunch Igor Pro with {normalized!r}: {e}"
         ) from e
 
-    deadline = time.monotonic() + wait_for_ready_seconds
-    attempts = 0
-    while time.monotonic() < deadline:
-        attempts += 1
-        if _reachable(timeout_ms=1000):
-            return {
-                "loaded_file": normalized,
-                "zmq_ready": True,
-                "poll_attempts": attempts,
-                "discarded_save_dialogs": discarded_save_dialogs,
-            }
-        time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+    experiment = os.path.splitext(os.path.basename(normalized))[0]
+    ready = _wait_until_ready(experiment, process.pid, wait_for_ready_seconds)
+    if ready["zmq_ready"] and ready["compiled"] is not False:
+        return {
+            "loaded_file": normalized,
+            **ready,
+            "discarded_save_dialogs": discarded_save_dialogs,
+        }
+    if ready["zmq_ready"]:
+        return {
+            "loaded_file": normalized,
+            **ready,
+            "discarded_save_dialogs": discarded_save_dialogs,
+            "note": (
+                "The experiment is loaded, but its procedures are not compiled. "
+                "read_session_history shows the compile error (Igor Pro launched with "
+                "/UNATTENDED prints it to the history)."
+            ),
+        }
 
     return {
         "loaded_file": normalized,
-        "zmq_ready": False,
-        "poll_attempts": attempts,
+        **ready,
         "discarded_save_dialogs": discarded_save_dialogs,
         "possible_dialogs": _possible_dialogs(),
         "note": (

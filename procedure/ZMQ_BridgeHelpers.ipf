@@ -35,6 +35,8 @@ static StrConstant ZBR_BIND_KEEPER_TASK        = "ZBR_BindKeeper"
 static Constant    ZBR_BIND_KEEPER_PERIOD      = 600 ///< [ticks], 10 s
 static StrConstant ZBR_REBIND_REQUEST_FOLDER   = "igor-pro-bridge"
 static StrConstant ZBR_REBIND_REQUEST_FILE     = "rebind-request-"
+static StrConstant ZBR_READY_FILE              = "ready-"
+static StrConstant ZBR_READY_PATH              = "ZBR_ReadyFolder"
 
 static StrConstant ZBR_REMEMBER_VFLAG_CALL = "ZBR#ZBR_RememberVFlag()"
 static StrConstant ZBR_REMOVE_VFLAG_CALL   = "ZBR#ZBR_RemoveVFlag()"
@@ -1036,6 +1038,71 @@ static Function/S ZBR_GetRebindRequestFile()
 	return ParseFilePath(5, localAppData, ":", 0, 0) + ":" + ZBR_REBIND_REQUEST_FOLDER + ":" + ZBR_REBIND_REQUEST_FILE + num2istr(ZBR_GetPort())
 End
 
+/// Path of the file by which we tell the bridge our state after a start or compile, see
+/// ZBR_WriteReadyFile(): %LOCALAPPDATA%\igor-pro-bridge\ready-<port>.json, "" without
+/// LOCALAPPDATA
+static Function/S ZBR_GetReadyFile()
+
+	string localAppData
+
+	localAppData = GetEnvironmentVariable("LOCALAPPDATA")
+	if(!strlen(localAppData))
+		return ""
+	endif
+
+	return ParseFilePath(5, localAppData, ":", 0, 0) + ":" + ZBR_REBIND_REQUEST_FOLDER + ":" + ZBR_READY_FILE + num2istr(ZBR_GetPort()) + ".json"
+End
+
+/// Escape a string for a JSON string value
+static Function/S ZBR_EscapeJSONString(string str)
+
+	str = ReplaceString("\\", str, "\\\\")
+	str = ReplaceString("\"", str, "\\\"")
+	str = ReplaceString("\r", str, "\\r")
+	str = ReplaceString("\n", str, "\\n")
+
+	return str
+End
+
+/// Write our state to the ready file, see ZBR_GetReadyFile()
+///
+/// The bridge waits for this file after launching Igor Pro instead of calling ZBR_Ping
+/// again and again: a request arriving while Igor Pro loads the procedures of an experiment
+/// slows down the load considerably. The file is written to a temporary file first and then
+/// moved, so the bridge never reads a partial file.
+///
+/// @param event name of the hook writing the file
+static Function ZBR_WriteReadyFile(string event)
+
+	variable refNum, bound, err
+	string file, tmpFile, boundStr, json
+
+	file = ZBR_GetReadyFile()
+	if(!strlen(file))
+		return 0
+	endif
+
+	NewPath/C/O/Q/Z $ZBR_READY_PATH, ParseFilePath(1, file, ":", 1, 0); err = GetRTError(1)
+	KillPath/Z $ZBR_READY_PATH
+
+	bound    = ZBR_IsEndpointBound(ZBR_GetEndpoint(ZBR_GetPort()))
+	boundStr = SelectString(numtype(bound) == 2, num2istr(bound), "null")
+
+	sprintf json, "{\"event\": \"%s\", \"experiment\": \"%s\", \"compiled\": %d, \"bound\": %s, \"dateTime\": %.0f}\n", event, ZBR_EscapeJSONString(IgorInfo(1)), ZBR_IsCompiled(), boundStr, DateTime
+
+	tmpFile = file + ".tmp"
+	Open/Z refNum as tmpFile; err = GetRTError(1)
+	if(V_flag || err)
+		return 0
+	endif
+	FBinWrite refNum, json
+	Close refNum
+
+	MoveFile/O/Z tmpFile as file; err = GetRTError(1)
+
+	return 0
+End
+
 /// Port of our ZeroMQ socket: IGOR_PRO_BRIDGE_PORT or the default port
 ///
 /// @param verbose [optional, defaults to false] print a message if IGOR_PRO_BRIDGE_PORT
@@ -1124,7 +1191,8 @@ static Function BeforeUncompiledHook(variable changeCode, string procedureWindow
 End
 
 /// Fires on Igor launch and on creating a new experiment. Binds/starts the ZeroMQ
-/// handler here (once per process) rather than in AfterCompiledHook.
+/// handler here (once per process) rather than in AfterCompiledHook. Writes the ready file,
+/// see ZBR_WriteReadyFile().
 static Function IgorStartOrNewHook(string igorApplicationNameStr)
 
 	variable modifiedBefore
@@ -1133,6 +1201,7 @@ static Function IgorStartOrNewHook(string igorApplicationNameStr)
 	modifiedBefore = V_flag
 
 	ZBR_EnsureZeroMQBound()
+	ZBR_WriteReadyFile("IgorStartOrNewHook")
 
 	if(!modifiedBefore)
 		ExperimentModified 0
@@ -1143,7 +1212,8 @@ End
 
 /// Bumps the compile-confirmation counter on every successful compile and starts the
 /// background task ZBR_BindKeeper, see ZBR_StartBindKeeper(). Does not touch the ZeroMQ
-/// socket/handler -- see IgorStartOrNewHook.
+/// socket/handler -- see IgorStartOrNewHook. Writes the ready file, see
+/// ZBR_WriteReadyFile().
 static Function AfterCompiledHook()
 
 	variable modifiedBefore
@@ -1158,6 +1228,7 @@ static Function AfterCompiledHook()
 	compileCounter += 1
 
 	ZBR_StartBindKeeper()
+	ZBR_WriteReadyFile("AfterCompiledHook")
 
 	if(!modifiedBefore)
 		ExperimentModified 0
