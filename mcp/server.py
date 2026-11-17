@@ -488,13 +488,14 @@ def _request_rebind() -> bool:
 
 def _diagnose_no_reply() -> str:
     """Short diagnosis why Igor Pro does not answer, from the OS process and window list.
-    Requests a rebind of the socket if Igor Pro runs and shows no dialog, see
-    _request_rebind."""
+    Requests a rebind of the socket if an Igor Pro process with windows runs and shows no
+    dialog, see _request_rebind."""
     try:
         pids = _list_igor_pids()
         if not pids:
             return "Igor Pro is not running."
-        dialogs = _possible_dialogs()
+        windows = _igor_windows()
+        dialogs = [w for w in windows if not w["is_main_window"] and w["title"]]
     except Exception:
         return "See check_bridge_health."
     if dialogs:
@@ -503,6 +504,22 @@ def _diagnose_no_reply() -> str:
             f"{_describe_dialogs(dialogs)}. A modal dialog blocks the bridge -- see "
             "list_igor_windows, click_igor_dialog_button and close_igor_window."
         )
+
+    # e.g. while the process starts or after its main window was closed on quit
+    pids_with_windows = {w["pid"] for w in windows}
+    windowless = [pid for pid in pids if pid not in pids_with_windows]
+    if not pids_with_windows:
+        return (
+            f"Igor Pro processes run (PIDs {windowless}), but none shows a window, so they "
+            "are probably still starting or quitting. Retry in a few seconds; if it "
+            "stays this way, a process may hang, see check_bridge_health."
+        )
+    windowless_note = (
+        f"Igor Pro processes without a window (PIDs {windowless}) are probably starting or "
+        "quitting. "
+        if windowless
+        else ""
+    )
     rebind = (
         f"Requested a rebind of the socket at {_igor_zmq_endpoint()} (e.g. after zeromq_stop() "
         "of other code), which Igor Pro does within "
@@ -513,6 +530,7 @@ def _diagnose_no_reply() -> str:
     return (
         "Igor Pro is running and shows no dialog, so it is probably busy (e.g. a long "
         "command, saving a large experiment) or its socket is not bound. "
+        + windowless_note
         + rebind
         + "Otherwise try again later or with a longer timeout; if it never answers, "
         "ZMQ_BridgeHelpers.ipf may not be loaded, see check_bridge_health."
