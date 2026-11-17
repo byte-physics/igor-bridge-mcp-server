@@ -4,6 +4,10 @@ Igor Pro MCP bridge server
 
 Exposes a running Igor Pro instance to Claude (or any MCP client) as a set of MCP tools.
 
+**v3.2.0**: launches wait for a ready file of the bridge procedures instead of polling
+Igor Pro, which slowed the load down; `run_igor_tests`/`get_igor_test_results` detect runs
+which never run (`token`, `wait_seconds`); compile errors of Igor Pro 10.03 are found again.
+
 **v3.1.1**: the bundled ZeroMQ-XOP 459 lets the bind keeper rebind a lost socket on
 its own; requests larger than the XOP's 64 KiB limit are rejected before sending.
 
@@ -488,13 +492,14 @@ def _request_rebind() -> bool:
 
 def _diagnose_no_reply() -> str:
     """Short diagnosis why Igor Pro does not answer, from the OS process and window list.
-    Requests a rebind of the socket if Igor Pro runs and shows no dialog, see
-    _request_rebind."""
+    Requests a rebind of the socket if an Igor Pro process with windows runs and shows no
+    dialog, see _request_rebind."""
     try:
         pids = _list_igor_pids()
         if not pids:
             return "Igor Pro is not running."
-        dialogs = _possible_dialogs()
+        windows = _igor_windows()
+        dialogs = [w for w in windows if not w["is_main_window"] and w["title"]]
     except Exception:
         return "See check_bridge_health."
     if dialogs:
@@ -503,6 +508,22 @@ def _diagnose_no_reply() -> str:
             f"{_describe_dialogs(dialogs)}. A modal dialog blocks the bridge -- see "
             "list_igor_windows, click_igor_dialog_button and close_igor_window."
         )
+
+    # e.g. while the process starts or after its main window was closed on quit
+    pids_with_windows = {w["pid"] for w in windows}
+    windowless = [pid for pid in pids if pid not in pids_with_windows]
+    if not pids_with_windows:
+        return (
+            f"Igor Pro processes run (PIDs {windowless}), but none shows a window, so they "
+            "are probably still starting or quitting. Retry in a few seconds; if it "
+            "stays this way, a process may hang, see check_bridge_health."
+        )
+    windowless_note = (
+        f"Igor Pro processes without a window (PIDs {windowless}) are probably starting or "
+        "quitting. "
+        if windowless
+        else ""
+    )
     rebind = (
         f"Requested a rebind of the socket at {_igor_zmq_endpoint()} (e.g. after zeromq_stop() "
         "of other code), which Igor Pro does within "
@@ -513,6 +534,7 @@ def _diagnose_no_reply() -> str:
     return (
         "Igor Pro is running and shows no dialog, so it is probably busy (e.g. a long "
         "command, saving a large experiment) or its socket is not bound. "
+        + windowless_note
         + rebind
         + "Otherwise try again later or with a longer timeout; if it never answers, "
         "ZMQ_BridgeHelpers.ipf may not be loaded, see check_bridge_health."
@@ -719,8 +741,11 @@ def check_compilation_state() -> dict:
 
 
 _COMPILE_POLL_INTERVAL_SECONDS = 0.5
-_COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+: error: .*$", re.MULTILINE)
+# Igor Pro 10.03 prints no colon after the column, e.g. "Basic.pxp:File.ipf:134:1 error: ..."
+_COMPILE_ERROR_REGEXP = re.compile(r"^.+?:\d+:\d+:? error: .*$", re.MULTILINE)
 _COMPILE_POLL_TIMEOUT_SECONDS = 15.0
+# After the compile counter went up, how long ProcGlobal may still report uncompiled
+_COMPILE_PROCGLOBAL_RECHECK_SECONDS = 2.0
 
 
 def _read_compile_counter():
@@ -912,11 +937,25 @@ def _reload_and_compile(before_submit=None) -> dict:
             and counter is not None
             and counter > baseline_counter
         ):
-            return {
-                "compiled": True,
-                "poll_attempts": attempts,
-                "confirmed_via": "AfterCompiledHook counter (ZBR_ReadCompileCounter)",
-            }
+            # AfterCompiledHook of the bridge's independent module also runs when ProcGlobal
+            # failed to compile
+            procglobal_compiled = False
+            recheck_deadline = time.monotonic() + _COMPILE_PROCGLOBAL_RECHECK_SECONDS
+            while True:
+                try:
+                    procglobal_compiled = bool(call_function("ZBR#ZBR_IsCompiled"))
+                except (IgorZmqError, IgorZmqUnreachable):
+                    procglobal_compiled = True
+                if procglobal_compiled or time.monotonic() >= recheck_deadline:
+                    break
+                time.sleep(_COMPILE_POLL_INTERVAL_SECONDS)
+            if procglobal_compiled:
+                return {
+                    "compiled": True,
+                    "poll_attempts": attempts,
+                    "confirmed_via": "AfterCompiledHook counter (ZBR_ReadCompileCounter)",
+                }
+            break
 
         # Before the queued reload/compile ran, ZBR_IsCompiled() still reports the state
         # before it, so it only decides once the compile is over.
@@ -1249,8 +1288,14 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
 
     The command runs with Igor's Debugger disabled, see execute_igor_command.
 
+    Then checks for up to 10 s whether the run goes on: a command which fails right away
+    (e.g. for unknown test cases), a dialog which blocks Igor Pro, or a run which ended
+    without JUnit output returns {"started": False, "run_status": ...}. A run which is
+    already finished returns a "note".
+
     Returns {"started_at": time stamp to pass to get_igor_test_results, "junit_folder",
-    "token" of the starting command, "compile": result of the compile step}."""
+    "token" of the starting command (pass it to get_igor_test_results as well), "compile":
+    result of the compile step}."""
     folder = junit_folder or _default_junit_folder()
 
     compile_result = None
@@ -1261,7 +1306,7 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
 
     started_at = time.time()
     token = call_function("ZBR#ZBR_SubmitCommandUnattended", [command])
-    return {
+    result = {
         "started": True,
         "started_at": started_at,
         "junit_folder": folder,
@@ -1269,27 +1314,124 @@ def run_igor_tests(command: str, junit_folder: str = "", compile_first: bool = T
         "compile": compile_result,
     }
 
+    status = _test_run_status(token, _TEST_START_CHECK_SECONDS)
+    if status["state"] == "ended" and _junit_result(folder, started_at) is not None:
+        result["note"] = "The run has already finished, see get_igor_test_results."
+    elif status["state"] in ("failed", "blocked", "ended"):
+        result["started"] = False
+        result["run_status"] = status
+    elif status["state"] == "unknown":
+        result["run_status"] = status
+    return result
 
-@mcp.tool()
-def get_igor_test_results(junit_folder: str, started_at: float = 0.0) -> dict:
-    """Return the results of a test run of IgorTest from its JUnit output, see
-    run_igor_tests.
 
-    Looks for the newest JU_*.xml file in `junit_folder` written after `started_at` (as
-    returned by run_igor_tests; 0 takes the newest file). Returns {"finished": False} while
-    there is none yet or it is still being written -- call again later, the test run itself
-    is not affected.
+_TEST_START_CHECK_SECONDS = 10.0
+_TEST_STATUS_SAMPLE_SECONDS = 0.5
+_TEST_RESULTS_POLL_SECONDS = 2.0
+_TEST_BUSY_BACKOFF_SECONDS = 30.0
+# How long a run may stay "between_tasks" before get_igor_test_results reports it stalled
+_TEST_STALLED_SECONDS = 120.0
+# Printed by IgorTest at the start and the end of a run (igortest-hooks.ipf)
+_IUTF_START_MARKER = 'Start of test "'
+_IUTF_END_MARKER = 'End of test "'
+_TEST_RESULTS_MAX_WAIT_SECONDS = 3000.0
+_TEST_OUTPUT_TAIL_CHARS = 3000
 
-    Once finished: {"finished": True, "junit_file", "total": {"tests", "failures",
-    "errors", "skipped"}, "suites": per test suite, "failures": every failed assertion or
-    error with its test case and message}."""
+
+def _idle_within(pid: int, max_seconds: float) -> Optional[bool]:
+    """True as soon as the process `pid` has been idle for _READY_IDLE_SECONDS (see
+    _READY_IDLE_CPU_FRACTION), False if it was busy during all of max_seconds, None if its
+    CPU time can not be read. Does not contact Igor Pro."""
+    deadline = time.monotonic() + max(max_seconds, _READY_IDLE_SECONDS)
+    last_cpu = _process_cpu_seconds(pid)
+    if last_cpu is None:
+        return None
+    idle_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(_TEST_STATUS_SAMPLE_SECONDS)
+        cpu = _process_cpu_seconds(pid)
+        if cpu is None:
+            return None
+        if cpu - last_cpu > _READY_IDLE_CPU_FRACTION * _TEST_STATUS_SAMPLE_SECONDS:
+            idle_since = time.monotonic()
+        elif time.monotonic() - idle_since >= _READY_IDLE_SECONDS:
+            return True
+        last_cpu = cpu
+    return False
+
+
+def _test_run_status(token: str, max_seconds: float) -> dict:
+    """State of the test run started by the command `token` of run_igor_tests, without a
+    JUnit file yet.
+
+    Igor Pro is only asked once its process is idle (see _idle_within): a test run without
+    background tasks keeps Igor Pro busy, and requests then only time out. Returns
+    {"state": ...} with
+    - "running": Igor Pro is busy, the command still runs or test background tasks run
+      ("background_tasks")
+    - "blocked": a dialog blocks Igor Pro ("dialogs")
+    - "failed": the command ended with an error ("error", "output")
+    - "ended": the command ended, no test background task runs and the history since the
+      command shows that IgorTest ended the run (_IUTF_END_MARKER) or never started it
+      (no _IUTF_START_MARKER), but there is no JUnit file; e.g. no test case ran or the
+      JUnit output was not enabled ("output")
+    - "between_tasks": the command ended and no test background task runs, but the run
+      started and did not end. IgorTest stops its monitor task before it calls a reentry
+      function and runs it, and the next test case up to its registration, from that
+      task, so this is normal for a short while ("output")
+    - "unknown": Igor Pro does not run or does not answer ("note")"""
+    pids = _list_igor_pids()
+    if not pids:
+        return {"state": "unknown", "note": "Igor Pro is not running."}
+
+    idle = _idle_within(pids[0], max_seconds)
+    if idle is False:
+        return {"state": "running"}
+
+    dialogs = _possible_dialogs()
+    if dialogs:
+        return {"state": "blocked", "dialogs": dialogs, "note": _describe_dialogs(dialogs)}
+
+    try:
+        status = poll_igor_command(token)
+        tasks = []
+        history = ""
+        if status["done"] and not status["error"]:
+            tasks = _running_background_tasks()
+            if not tasks:
+                history = call_function("ZBR#ZBR_GetHistorySinceToken", [token]) or ""
+    except IgorZmqUnreachable:
+        # no dialog, so the run keeps Igor Pro busy although it uses little CPU, e.g.
+        # while it updates windows
+        return {"state": "running", "busy": True}
+    except (IgorZmqError, RuntimeError) as e:
+        return {"state": "unknown", "note": str(e)}
+
+    if not status["done"]:
+        return {"state": "running"}
+
+    output = status["output"] if isinstance(status["output"], str) else ""
+    output = output[-_TEST_OUTPUT_TAIL_CHARS:]
+    if status["error"]:
+        return {"state": "failed", "error": status["error"], "output": output}
+    if tasks:
+        return {"state": "running", "background_tasks": tasks}
+    history_tail = history[-_TEST_OUTPUT_TAIL_CHARS:]
+    if _IUTF_START_MARKER in history and _IUTF_END_MARKER not in history:
+        return {"state": "between_tasks", "output": history_tail}
+    return {"state": "ended", "output": history_tail or output}
+
+
+def _junit_result(junit_folder: str, started_at: float) -> Optional[dict]:
+    """Parsed newest JUnit file written after `started_at`, or {"finished": False, ...} with
+    a note while it is still being written, None if there is none."""
     files = {
         path: mtime
         for path, mtime in _junit_files(junit_folder).items()
         if mtime >= started_at
     }
     if not files:
-        return {"finished": False}
+        return None
 
     newest = max(files, key=files.get)
     if time.time() - files[newest] < _JUNIT_STABLE_SECONDS:
@@ -1300,6 +1442,69 @@ def get_igor_test_results(junit_folder: str, started_at: float = 0.0) -> dict:
     except Exception as e:
         return {"finished": False, "note": f"Could not parse {newest} yet: {e}"}
     return {"finished": True, **result}
+
+
+@mcp.tool()
+def get_igor_test_results(
+    junit_folder: str, started_at: float = 0.0, token: str = "", wait_seconds: float = 0.0
+) -> dict:
+    """Return the results of a test run of IgorTest from its JUnit output, see
+    run_igor_tests.
+
+    Looks for the newest JU_*.xml file in `junit_folder` written after `started_at` (as
+    returned by run_igor_tests; 0 takes the newest file). Returns {"finished": False} while
+    there is none yet or it is still being written -- call again later, the test run itself
+    is not affected.
+
+    With the `token` of run_igor_tests, it also checks whether the run still goes on while
+    there is no JUnit file, see _test_run_status: if the start command failed, the run ended
+    without JUnit output, a dialog blocks Igor Pro, or a started run neither ended nor has a
+    test background task running for 2 minutes while Igor Pro is idle ("stalled"), it
+    returns {"finished": True, "ran": False, "run_status": ...} instead of waiting in vain.
+
+    `wait_seconds` (at most 3000) waits for the results inside this call, checking every
+    few seconds, and returns as soon as they are there or the run is found dead. Prefer
+    it over waiting outside the bridge. Requests reach Igor Pro only while it is idle.
+
+    Once finished: {"finished": True, "junit_file", "total": {"tests", "failures",
+    "errors", "skipped"}, "suites": per test suite, "failures": every failed assertion or
+    error with its test case and message}."""
+    deadline = time.monotonic() + min(max(wait_seconds, 0.0), _TEST_RESULTS_MAX_WAIT_SECONDS)
+    next_status_check = 0.0
+    between_tasks_since = None
+    status = None
+    while True:
+        result = _junit_result(junit_folder, started_at)
+        if result is not None and result["finished"]:
+            return result
+
+        if token and result is None and time.monotonic() >= next_status_check:
+            remaining = deadline - time.monotonic()
+            status = _test_run_status(token, min(max(remaining, 0.0), _TEST_RESULTS_POLL_SECONDS))
+            if status.get("busy"):
+                # unanswered requests only disturb the run
+                next_status_check = time.monotonic() + _TEST_BUSY_BACKOFF_SECONDS
+            if status["state"] != "between_tasks":
+                between_tasks_since = None
+            elif between_tasks_since is None:
+                between_tasks_since = time.monotonic()
+            elif time.monotonic() - between_tasks_since >= _TEST_STALLED_SECONDS:
+                status = {**status, "state": "stalled"}
+                return {"finished": True, "ran": False, "run_status": status}
+            if status["state"] in ("failed", "blocked", "ended"):
+                # the JUnit file may have been written meanwhile
+                result = _junit_result(junit_folder, started_at)
+                if result is not None and result["finished"]:
+                    return result
+                if status["state"] != "ended" or result is None:
+                    return {"finished": True, "ran": False, "run_status": status}
+
+        if time.monotonic() >= deadline:
+            pending = result or {"finished": False}
+            if status is not None:
+                pending["run_status"] = status
+            return pending
+        time.sleep(min(_TEST_RESULTS_POLL_SECONDS, max(deadline - time.monotonic(), 0.0)))
 
 
 # --- Debugger control --------------------------------------------------------------
@@ -1817,7 +2022,7 @@ def edit_help_file(
 # reason as before: the on-disk layout after Claude Desktop installs a .mcpb isn't
 # guaranteed to keep server.py and manifest.json at a fixed relative path, and this
 # needs to be confirmable from inside a conversation independent of that.
-_BRIDGE_VERSION = "3.1.1"
+_BRIDGE_VERSION = "3.2.0"
 
 
 def _installed_package_version(distribution_name: str) -> str | None:
@@ -1918,7 +2123,13 @@ def check_bridge_health() -> dict:
 # closable without OS focus changes. Window titles are not matched against a fixed list
 # (except for the automatic compile-error dismissal), as they depend on Igor's language.
 
-_IGOR_PROCESS_NAME_PREFIX = "igor"
+# Igor64.exe, Igor.exe of 32-bit versions; not e.g. igor-mcp-server.exe of the WaveMetrics
+# MCP server, which has no windows and would look like a hanging Igor Pro
+_IGOR_PROCESS_NAME_REGEXP = re.compile(r"^igor(64)?\.exe$", re.IGNORECASE)
+
+
+def _is_igor_exe(exe_name) -> bool:
+    return bool(exe_name) and bool(_IGOR_PROCESS_NAME_REGEXP.match(exe_name))
 _KNOWN_STUCK_DIALOG_TITLES = ("Function Compilation Error",)
 _SAVE_EXPERIMENT_QUESTION_REGEXP = re.compile(r"^Do you want to save changes to experiment ")
 _POSTED_KEY_GAP_SECONDS = 0.05
@@ -1994,7 +2205,7 @@ def _list_igor_pids() -> list:
         if pid == 0:
             continue
         exe_name = _get_process_exe_name(pid)
-        if exe_name and exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+        if _is_igor_exe(exe_name):
             pids.append(pid)
     return pids
 
@@ -2008,7 +2219,7 @@ def _igor_windows(include_hidden: bool = False) -> list:
             return True
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         exe_name = _get_process_exe_name(pid)
-        if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+        if not _is_igor_exe(exe_name):
             return True
         title = win32gui.GetWindowText(hwnd)
         owner = win32gui.GetWindow(hwnd, win32con.GW_OWNER)
@@ -2051,7 +2262,7 @@ def _require_igor_window(hwnd: int):
         raise RuntimeError(f"Window {hwnd} does not exist (anymore).")
     _, pid = win32process.GetWindowThreadProcessId(hwnd)
     exe_name = _get_process_exe_name(pid)
-    if not exe_name or not exe_name.lower().startswith(_IGOR_PROCESS_NAME_PREFIX):
+    if not _is_igor_exe(exe_name):
         raise RuntimeError(f"Window {hwnd} does not belong to an Igor Pro process.")
 
 
@@ -2518,6 +2729,159 @@ def configure_igor_launch(exe_path: str, port: Optional[int] = None) -> dict:
 
 
 _POST_LAUNCH_POLL_INTERVAL_SECONDS = 1.0
+_READY_FILE_POLL_INTERVAL_SECONDS = 0.25
+_READY_PING_INTERVAL_SECONDS = 2.0
+_READY_PING_TIMEOUT_MS = 5000
+# A ready file reporting uncompiled procedures may be followed by one of a later successful
+# compile, e.g. of ProcGlobal after the independent module of the bridge
+_READY_NOT_COMPILED_GRACE_SECONDS = 3.0
+# Igor Pro counts as idle while it uses less than this fraction of one core. Loading
+# takes a full core, an idle Basic.pxp of MIES 3-12 % for its background tasks.
+_READY_IDLE_CPU_FRACTION = 0.25
+_READY_IDLE_SECONDS = 2.0
+_READY_PROBE_INTERVAL_SECONDS = 5.0
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _ready_file():
+    """File by which Igor Pro reports its state after a start or compile, see
+    ZBR_WriteReadyFile in ZMQ_BridgeHelpers.ipf:
+    %LOCALAPPDATA%\\igor-pro-bridge\\ready-<port>.json."""
+    port = _igor_zmq_endpoint().rsplit(":", 1)[1]
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "igor-pro-bridge", f"ready-{port}.json"
+    )
+
+
+def _remove_ready_file():
+    """Remove the ready file before a launch, so only the new process can write it."""
+    if not os.environ.get("LOCALAPPDATA"):
+        return
+    try:
+        os.remove(_ready_file())
+    except FileNotFoundError:
+        pass
+
+
+def _read_ready_file() -> Optional[dict]:
+    """Contents of the ready file, None if it does not exist or can not be read."""
+    try:
+        with open(_ready_file(), encoding="utf-8") as f:
+            return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def _process_cpu_seconds(pid: int) -> Optional[float]:
+    """CPU time (user + kernel) of the process in seconds, None if it can not be read."""
+    try:
+        handle = win32api.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            times = win32process.GetProcessTimes(handle)
+        finally:
+            win32api.CloseHandle(handle)
+    except Exception:
+        return None
+    return (times["UserTime"] + times["KernelTime"]) / 1e7
+
+
+def _probe_igor_state(timeout_ms: int) -> Optional[dict]:
+    """Ask Igor Pro for its experiment and whether its procedures are compiled. None if it
+    does not answer."""
+    try:
+        info = str(call_function("ZBR#ZBR_Ping", timeout_ms=timeout_ms))
+    except (IgorZmqError, IgorZmqUnreachable):
+        return None
+    match = re.search(r"\|experiment=([^|]*)", info)
+    try:
+        compiled = bool(call_function("ZBR#ZBR_IsCompiled", timeout_ms=timeout_ms))
+    except (IgorZmqError, IgorZmqUnreachable):
+        compiled = None
+    return {"experiment": match.group(1) if match else None, "compiled": compiled}
+
+
+def _experiment_matches(name, experiment: Optional[str]) -> bool:
+    return experiment is None or str(name or "").lower() == experiment.lower()
+
+
+def _wait_until_ready(experiment: Optional[str], pid: int, wait_for_ready_seconds: float) -> dict:
+    """Wait until a freshly launched Igor Pro is ready, see _remove_ready_file.
+
+    Igor Pro writes the ready file from IgorStartOrNewHook and AfterCompiledHook. This
+    reads the file until it reports compiled procedures for `experiment` (the experiment
+    name, None for any), and only then confirms with ZBR#ZBR_Ping. Requests from the
+    start slow the load down: with ZBR#ZBR_Ping every 2 s, Basic.pxp of MIES took
+    41-45 s until compiled instead of 15 s.
+
+    A failed compile calls no hook, so the file then never names the experiment. The CPU
+    time of the process `pid` tells when Igor Pro is done anyway: once it has been idle
+    for _READY_IDLE_SECONDS, this asks Igor Pro for its experiment and compile state (at
+    most every _READY_PROBE_INTERVAL_SECONDS), which costs nothing while it is idle.
+
+    Without LOCALAPPDATA there is no ready file, and this polls ZBR#ZBR_Ping as before.
+
+    Returns {"zmq_ready", "compiled" (None if unknown), "poll_attempts" (requests sent),
+    "ready_file" (its last contents or None)}."""
+    deadline = time.monotonic() + wait_for_ready_seconds
+    attempts = 0
+
+    if not os.environ.get("LOCALAPPDATA"):
+        while time.monotonic() < deadline:
+            attempts += 1
+            if _reachable(timeout_ms=1000):
+                return {"zmq_ready": True, "compiled": None, "poll_attempts": attempts, "ready_file": None}
+            time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+        return {"zmq_ready": False, "compiled": None, "poll_attempts": attempts, "ready_file": None}
+
+    def result(zmq_ready, compiled):
+        return {"zmq_ready": zmq_ready, "compiled": compiled, "poll_attempts": attempts, "ready_file": state}
+
+    state = None
+    not_compiled_since = None
+    last_ping = None
+    last_cpu = None
+    idle_since = None
+    last_probe = None
+    while time.monotonic() < deadline:
+        state = _read_ready_file()
+        matches = state is not None and _experiment_matches(state.get("experiment"), experiment)
+        now = time.monotonic()
+        if matches and state.get("compiled"):
+            not_compiled_since = None
+            if last_ping is None or now - last_ping >= _READY_PING_INTERVAL_SECONDS:
+                attempts += 1
+                last_ping = now
+                if _reachable(timeout_ms=_READY_PING_TIMEOUT_MS):
+                    return result(True, True)
+        elif matches:
+            if not_compiled_since is None:
+                not_compiled_since = now
+            elif now - not_compiled_since >= _READY_NOT_COMPILED_GRACE_SECONDS:
+                attempts += 1
+                return result(_reachable(timeout_ms=_READY_PING_TIMEOUT_MS), False)
+        else:
+            cpu = _process_cpu_seconds(pid)
+            busy = cpu is None or last_cpu is None or cpu - last_cpu > _READY_IDLE_CPU_FRACTION * _READY_FILE_POLL_INTERVAL_SECONDS
+            last_cpu = cpu
+            if busy:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = now
+            elif now - idle_since >= _READY_IDLE_SECONDS and (
+                last_probe is None or now - last_probe >= _READY_PROBE_INTERVAL_SECONDS
+            ):
+                attempts += 1
+                last_probe = now
+                probe = _probe_igor_state(_READY_PING_TIMEOUT_MS)
+                if probe is not None and _experiment_matches(probe["experiment"], experiment):
+                    return result(True, probe["compiled"])
+        time.sleep(_READY_FILE_POLL_INTERVAL_SECONDS)
+
+    attempts += 1
+    probe = _probe_igor_state(1000)
+    if probe is None:
+        return result(False, None)
+    return result(True, probe["compiled"] if _experiment_matches(probe["experiment"], experiment) else None)
 
 
 @mcp.tool()
@@ -2551,9 +2915,12 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
     Patches COMSPEC into the child's environment if missing (see
     _build_igor_launch_env) -- needed for MIES's own git-based startup hook.
 
-    After launching, polls for ZBR#ZBR_Ping to start answering (every ~1s) up to
-    wait_for_ready_seconds. Returns whether it became ready and how many polling
-    attempts that took.
+    After launching, waits up to wait_for_ready_seconds for the ready file which
+    ZMQ_BridgeHelpers.ipf writes after the start and after each compile, and then
+    confirms with ZBR#ZBR_Ping, see _wait_until_ready. Requests during the start would
+    slow it down. Returns whether it became ready ("zmq_ready"), whether the procedures
+    are compiled ("compiled"), the number of pings sent ("poll_attempts") and the last
+    contents of the ready file ("ready_file").
     """
     if not _resolve_igor_exe_path():
         raise RuntimeError(
@@ -2574,26 +2941,22 @@ def launch_igor_pro_unattended(wait_for_ready_seconds: float = 30.0) -> dict:
             ),
         }
 
+    _remove_ready_file()
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [_configured_igor_exe_path, "/UNATTENDED"],
             env=_build_igor_launch_env(),
         )
     except Exception as e:
         return {"launched": False, "reason": f"Failed to start the process ({e})."}
 
-    deadline = time.monotonic() + wait_for_ready_seconds
-    attempts = 0
-    while time.monotonic() < deadline:
-        attempts += 1
-        if _reachable(timeout_ms=1000):
-            return {"launched": True, "zmq_ready": True, "poll_attempts": attempts}
-        time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+    ready = _wait_until_ready(None, process.pid, wait_for_ready_seconds)
+    if ready["zmq_ready"]:
+        return {"launched": True, **ready}
 
     return {
         "launched": True,
-        "zmq_ready": False,
-        "poll_attempts": attempts,
+        **ready,
         "note": (
             f"The process was started, but nothing answered ZBR#ZBR_Ping within "
             f"{wait_for_ready_seconds:.0f}s. Igor Pro may still be initializing "
@@ -2692,8 +3055,12 @@ def load_experiment(
        `/UNATTENDED` plus the target file path as a launch argument -- passing a file
        path on launch is documented (Advanced Topics.ihf, "Calling Igor from
        Scripts") to open that specific file.
-    4. Polls for the new instance to start answering ZBR#ZBR_Ping, same as
-       launch_igor_pro_unattended.
+    4. Waits for the ready file of the new instance to report the experiment with
+       compiled procedures and confirms with ZBR#ZBR_Ping, same as
+       launch_igor_pro_unattended. Requests while Igor Pro loads the procedures slow
+       the load down considerably (Basic.pxp of MIES: 41-45 s instead of 15 s). If the
+       procedures do not compile, this returns "compiled": False right away instead of
+       waiting for wait_for_ready_seconds.
 
     **Step 2 is not optional, and checking ZeroMQ reachability alone is not enough --
     confirmed live (user report) after an early version of this tool relied on exactly
@@ -2750,8 +3117,9 @@ def load_experiment(
         "Relaunching now would risk silently doing nothing (see this tool's own docstring).",
     )
 
+    _remove_ready_file()
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             [_configured_igor_exe_path, "/UNATTENDED", normalized],
             env=_build_igor_launch_env(),
         )
@@ -2760,23 +3128,29 @@ def load_experiment(
             f"Failed to relaunch Igor Pro with {normalized!r}: {e}"
         ) from e
 
-    deadline = time.monotonic() + wait_for_ready_seconds
-    attempts = 0
-    while time.monotonic() < deadline:
-        attempts += 1
-        if _reachable(timeout_ms=1000):
-            return {
-                "loaded_file": normalized,
-                "zmq_ready": True,
-                "poll_attempts": attempts,
-                "discarded_save_dialogs": discarded_save_dialogs,
-            }
-        time.sleep(_POST_LAUNCH_POLL_INTERVAL_SECONDS)
+    experiment = os.path.splitext(os.path.basename(normalized))[0]
+    ready = _wait_until_ready(experiment, process.pid, wait_for_ready_seconds)
+    if ready["zmq_ready"] and ready["compiled"] is not False:
+        return {
+            "loaded_file": normalized,
+            **ready,
+            "discarded_save_dialogs": discarded_save_dialogs,
+        }
+    if ready["zmq_ready"]:
+        return {
+            "loaded_file": normalized,
+            **ready,
+            "discarded_save_dialogs": discarded_save_dialogs,
+            "note": (
+                "The experiment is loaded, but its procedures are not compiled. "
+                "read_session_history shows the compile error (Igor Pro launched with "
+                "/UNATTENDED prints it to the history)."
+            ),
+        }
 
     return {
         "loaded_file": normalized,
-        "zmq_ready": False,
-        "poll_attempts": attempts,
+        **ready,
         "discarded_save_dialogs": discarded_save_dialogs,
         "possible_dialogs": _possible_dialogs(),
         "note": (

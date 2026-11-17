@@ -514,3 +514,53 @@ follow-up calls instead of re-declaring.
   changes), while a queued `NEWEXPERIMENT` discards the changes without asking.
   `load_experiment` answers only this experiment question with "No" (that is what `Quit/N`
   intends); questions about unsaved procedure files are left to the user.
+
+## Waiting for a launched Igor Pro: ready file instead of polling
+
+`load_experiment` and `launch_igor_pro_unattended` used to call `ZBR#ZBR_Ping` every ~2 s
+(1 s receive timeout plus 1 s pause) until Igor Pro answered. These requests slow the load
+down considerably: Basic.pxp of MIES (261 procedure files) took 41-45 s from opening until
+compiled with the polling, 15 s without it (Igor Pro 10.03, measured with the MIES log hook
+timestamps, 2026-11-17). Each request that timed out also left one "Emergency SendReply ...
+Host unreachable" line of the XOP in the history. Igor Pro runs one core at 100 % during the
+whole load either way; data, compile (6 s) and disk access are not the cause.
+
+Now `ZMQ_BridgeHelpers.ipf` writes `%LOCALAPPDATA%\igor-pro-bridge\ready-<port>.json`
+(`ZBR_WriteReadyFile`: hook name, experiment name, ProcGlobal compiled, socket bound) from
+`IgorStartOrNewHook` and `AfterCompiledHook`. The bridge removes the file before the launch,
+reads only the file until it names the expected experiment with compiled procedures, and then
+confirms with one `ZBR#ZBR_Ping`.
+
+A failed compile calls no hook, so the file never names the experiment then. The bridge
+watches the CPU time of the launched process instead: after 2 s below 25 % of a core (loading
+takes a full core, an idle MIES experiment 3-12 % for its background tasks), it asks Igor Pro
+once for its experiment and `ZBR_IsCompiled()`, which costs nothing while Igor Pro is idle, and
+returns `"compiled": false` with a pointer to the compile error in the history.
+
+## Test runs which never run
+
+`run_igor_tests` used to return "started" as soon as the command was queued, and
+`get_igor_test_results` returned `{"finished": false}` as long as there was no JUnit file. A
+run which failed right away (compile error, unknown test case, JUnit output not enabled, a
+dialog) therefore looked like a run still going on, and the caller waited in vain.
+
+`_test_run_status` now tells these cases apart. It asks Igor Pro only once the process has
+been idle for 2 s (CPU time below 25 % of a core), as a synchronous run keeps Igor Pro busy and
+requests then only time out. Some runs use little CPU anyway, e.g. `UTF_SweepFormula.ipf` while
+it updates windows, so a request without a reply and without a dialog counts as "running", and
+`get_igor_test_results` then asks again only after 30 s. Order of the checks: dialogs, the
+result of the start command (`ZBR_PollCommand`), running background tasks (test cases running
+in background tasks), then IgorTest's own history lines since the start command
+(`ZBR_GetHistorySinceToken`): `End of test "..."` or no `Start of test "..."` at all means the
+run "ended" without JUnit output. A started run without end line and without running task is
+"between_tasks": before IgorTest calls a reentry function it stops its monitor task
+`IUTFBackgroundMonitor` and runs the reentry function and the next test case up to its
+registration from that task, while a hardware test waits with little CPU. A first version
+without the history check reported such a reentry test of `UTF_BasicHardwareTests.ipf` as
+"ended". `get_igor_test_results` reports a run as "stalled" only after 2 minutes in that state. IgorTest reports an
+unknown test case only in the history ("Error 8 in CreateTestRunSetup: Could not find test
+case ..."), not as error of the command, so that case shows up as "ended" with the history.
+
+`run_igor_tests` checks for up to 10 s after queuing the command, `get_igor_test_results` with
+the `token` of the run on every call, and with `wait_seconds` it waits inside the bridge until
+the results are there or the run is found dead.

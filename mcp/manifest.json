@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "igor-pro-bridge",
   "display_name": "Igor Pro Bridge",
-  "version": "3.1.1",
+  "version": "3.2.0",
   "description": "Control a running Igor Pro instance via the ZeroMQ-XOP's CallFunction interface: run commands, read wave data, manage compilation, load experiments, and launch Igor Pro itself, directly from Claude.",
-  "long_description": "v3.1.1: the bundled ZeroMQ-XOP is updated to version-459-gd9173ee. With it, the background task rebinds the bridge socket on its own after `zeromq_stop()` of other code, without waiting for a failed request, and can no longer hang Igor Pro. Requests larger than the 64 KiB the XOP accepts are rejected with a clear error instead of running into the receive timeout; use `run_igor_code` for long code. Install the new XOP from the ZeroMQ-XOP folder.",
+  "long_description": "v3.2.0: faster and more reliable starts and test runs. `load_experiment` and `launch_igor_pro_unattended` wait for a ready file written by the bridge procedures instead of calling Igor Pro every 2 s, which slowed the load down considerably (MIES Basic.pxp: 15 s instead of 41-45 s until compiled), and report `\"compiled\": false` right away when the procedures do not compile. `run_igor_tests` and `get_igor_test_results` (new arguments `token` and `wait_seconds`) detect runs which never run or ended without JUnit output, also across reentry functions. Compile errors of Igor Pro 10.03 are found again, a compile error of ProcGlobal is no longer reported as success, and only Igor64.exe/Igor.exe count as Igor Pro (not the WaveMetrics igor-mcp-server.exe). Update the bridge procedures in Igor Pro.",
   "author": {
     "name": "Michael Huth"
   },
@@ -55,11 +55,11 @@
     },
     {
       "name": "run_igor_tests",
-      "description": "Compile and start a test run of IgorTest, returning immediately"
+      "description": "Compile and start a test run of IgorTest, check that it goes on, and return"
     },
     {
       "name": "get_igor_test_results",
-      "description": "Return the results of an IgorTest run from its JUnit output once finished"
+      "description": "Return the results of an IgorTest run from its JUnit output, optionally waiting for them; detects runs which never run"
     },
     {
       "name": "read_session_history",
